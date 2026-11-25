@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "title": "字幕工坊",
+    "description": "把「挑片 → 转写 → 翻译 → 压制 → 落盘 → 通知」做成一条可配置的本地流水线。设置 → 字幕工坊里分 8 个 tab：概览、引擎、来源与输出、选片、提示词、画质音频、调度、诊断；保存走原子写并保留未知键，运行/选片/自检/日志都由包内 engine/subtitle-run 执行。",
+    "detail": "docs/DETAIL.zh.md"
+  },
+  "ui": {
+    "f.notify.qqAppId": "QQ Bot AppID",
+    "h.notify.qqAppId": "开放平台机器人详情页里的 AppID，非机密，存在 config.json",
+    "f.notify.qqOpenId": "接收人 OpenID",
+    "h.notify.qqOpenId": "机器人收到消息后，开放平台事件里的 openid",
+    "f.notify.qqSecretService": "钥匙串服务名",
+    "h.notify.qqSecretService": "留空 = subtitle-studio-qqbot；钥匙串账号是已保存配置里的 AppID",
+    "f.notify.qqSecret": "AppSecret",
+    "h.notify.qqSecret": "只写进系统钥匙串，永不回显；账号取已保存配置里的 AppID，所以改完 AppID 要先保存配置。",
+    "notify.secretStateSaved": "已保存到钥匙串",
+    "notify.secretStateMissing": "未配置",
+    "notify.secretStateEnv": "已由环境变量提供",
+    "notify.secretPlaceholder": "粘贴 AppSecret（仅写入钥匙串）",
+    "notify.saveSecret": "保存密钥",
+    "notify.sendTest": "发送测试消息",
+    "notify.secretEmpty": "先填入 AppSecret",
+    "notify.secretSaved": "密钥已保存到钥匙串",
+    "notify.secretSaveFailed": "保存密钥失败",
+    "notify.testSent": "测试消息已发送",
+    "notify.testSkipped": "测试消息未发送",
+    "notify.testFailed": "测试消息发送失败",
+    "notify.testHint": "测试消息使用已保存的配置发送",
+    "notify.noneHint": "不发送任何通知",
+    "notify.openidHelp": "粘贴机器人收到的消息 JSON，我帮你取 openid",
+    "notify.openidToggle": "粘贴消息取 openid",
+    "notify.extractOpenid": "提取 openid",
+    "notify.openidMissing": "没找到 openid",
+    "notify.openidFound": "已填入 openid",
+    "notify.advanced": "高级：回退到自定义发送脚本"
+  }
+}

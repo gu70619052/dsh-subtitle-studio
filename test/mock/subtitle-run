@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Mock engine for the UI smoke test: only the shapes the panel consumes."""
+import json, os, sys, time, pathlib
+
+args = sys.argv[1:]
+cmd = args[0] if args else 'status'
+state = pathlib.Path(os.environ.get('MOCK_STATE', '/tmp/mock-studio'))
+state.mkdir(parents=True, exist_ok=True)
+
+
+def emit(data, ok=True, code=0):
+    print(json.dumps({'ok': ok, 'data': data}, ensure_ascii=False))
+    sys.exit(code)
+
+
+if cmd == 'doctor':
+    emit({'verdict': 'green', 'summary': {'ok': 2, 'warn': 0, 'error': 0, 'info': 1},
+          'checks': [
+              {'name': 'ffmpeg', 'group': '依赖', 'level': 'ok', 'message': '9.0.2', 'detail': {'hint': 'ok'}},
+              {'name': '磁盘空间', 'group': '环境', 'level': 'ok', 'message': '120 GB 可用'},
+              {'name': '自定义通知脚本', 'group': '通知', 'level': 'warn', 'message': '未配置', 'detail': {'hint': '可选'}},
+              # 与真实引擎 lib/doctor.py 的分组保持一致：config / deps / engine / disk / notify
+              {'name': 'config', 'group': 'config', 'level': 'ok', 'message': '配置已加载'},
+              {'name': 'python', 'group': 'deps', 'level': 'ok', 'message': 'python3 3.11'},
+              {'name': 'ffprobe', 'group': 'deps', 'level': 'ok', 'message': 'ffprobe 9.0.2'},
+              {'name': 'engine', 'group': 'engine', 'level': 'ok', 'message': 'dsh / fake-model'},
+              {'name': 'disk.local', 'group': 'disk', 'level': 'ok', 'message': '120 GB 可用'},
+          ]})
+if cmd == 'plan':
+    emit({'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+          'quota': {'max': 2, 'used': 0},
+          'candidates': [
+              {'name': '第01话 [1080p].mp4', 'selected': True, 'size': 1.2, 'reasonText': ''},
+              {'name': '第02话 [1080p].mp4', 'selected': True, 'size': 1.1, 'reasonText': ''},
+          ],
+          'skipped': [{'name': '第00话.mp4', 'reasonText': '已存在译文'}]})
+if cmd == 'status':
+    log = state / 'run.log'
+    emit({'running': False, 'lock': None, 'today': {'processed': 0, 'skipped': 0},
+          'lastRun': {'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'ok': True, 'exitCode': 0},
+          'paths': {'log': str(log)}, 'logs': {'run': str(log)}})
+if cmd in ('run', 'selftest'):
+    run_id = f'{cmd}-{int(time.time())}'
+    logs_dir = pathlib.Path(os.environ.get('SUBTITLE_STUDIO_DATA_DIR', str(state))) / 'logs'
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log = logs_dir / 'run.log'
+    log.write_text('stage: mock\nrun: done\n', encoding='utf-8')
+    aux = state / f'{run_id}.log'
+    aux.write_text('mock run started\nmock run finished\n', encoding='utf-8')
+    # 与真实引擎 pipeline.execute 的载荷形状保持一致：actions 是逐条处理结果。
+    emit({'runId': run_id, 'kind': cmd, 'args': args[1:],
+          'actions': [{'name': '第01话.mp4', 'status': 'ok', 'output': '/tmp/mock-studio/第01话_zh.mp4'}],
+          'note': 'mock run'})
+emit({'note': 'mock'})

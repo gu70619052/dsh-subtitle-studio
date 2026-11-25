@@ -1,0 +1,7 @@
+# 字幕工坊（Subtitle Studio）。
+# Host 半在本机提供 /api/dsh-subtitle-studio 桥：读写 config.json、拉起 engine/subtitle-run、
+# 管理 launchd 调度、列目录与日志；Client 半由 package.json 的 dsh.client 声明，
+# 在「设置」左侧注册一个独立分区（内部 8 个 tab）。
+- insert:
+    - id: subtitle-studio
+      name: 'dsh-subtitle-studio'

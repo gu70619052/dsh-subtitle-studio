@@ -1,0 +1,7 @@
+test/sandbox*/
+**/__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+# maintainer's own fingerprints, never published
+test/privacy-patterns.local

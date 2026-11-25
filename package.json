@@ -1,0 +1,63 @@
+{
+  "name": "dsh-subtitle-studio",
+  "version": "1.4.0",
+  "type": "module",
+  "description": "Subtitle Studio for DeepSeek Harness: pick videos, transcribe, translate, burn in subtitles and deliver — a configurable local pipeline with a settings panel and an engine CLI bridge. macOS only (Apple Silicon recommended).",
+  "license": "MIT",
+  "author": "gu70619052",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gu70619052/dsh-subtitle-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gu70619052/dsh-subtitle-studio/issues"
+  },
+  "homepage": "https://github.com/gu70619052/dsh-subtitle-studio#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "subtitle",
+    "translation",
+    "whisper",
+    "ffmpeg",
+    "macos"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "engine",
+    "locale",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

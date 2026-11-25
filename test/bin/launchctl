@@ -1,0 +1,76 @@
+#!/bin/sh
+# Fake launchctl for the host bridge tests.
+#
+# The real launchctl would touch the user's own launchd session, so the tests
+# put this directory first on PATH and let it stand in:
+#   print    <domain>/<label>   exit 0 when the label is "loaded"
+#   bootstrap <domain> <plist>  exit 0, or fail when FAKE_BOOTSTRAP_FAIL is set
+#   bootout  <domain>/<label>   exit 0 and forget the label
+#
+# Loaded labels live in $FAKE_LAUNCHCTL_STATE, every call is appended to
+# $FAKE_LAUNCHCTL_LOG.
+set -e
+
+LOG="${FAKE_LAUNCHCTL_LOG:-/dev/null}"
+STATE="${FAKE_LAUNCHCTL_STATE:-/tmp/fake-launchctl.labels}"
+
+printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true
+
+cmd="${1:-}"
+shift 2>/dev/null || true
+
+label_of() {
+  printf '%s' "${1##*/}"
+}
+
+# The bootstrap call carries the domain, not the label; the label lives in the
+# plist under <key>Label</key>.
+label_from_plist() {
+  awk '/<key>Label<\/key>/{getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit}' "$1" 2>/dev/null
+}
+
+is_loaded() {
+  [ -f "$STATE" ] && grep -qx "$1" "$STATE" 2>/dev/null
+}
+
+case "$cmd" in
+  print)
+    target="${1:-}"
+    label="$(label_of "$target")"
+    if is_loaded "$label"; then
+      echo "fake launchctl: $label is loaded"
+      exit 0
+    fi
+    echo "Could not find service \"$target\"" >&2
+    exit 113
+    ;;
+  bootstrap)
+    plist="${2:-}"
+    label="$(label_from_plist "$plist")"
+    if [ -z "$label" ]; then
+      echo "fake launchctl: no Label key in $plist" >&2
+      exit 1
+    fi
+    if [ -n "${FAKE_BOOTSTRAP_FAIL:-}" ]; then
+      echo "Load failed: 5: Input/output error" >&2
+      exit 5
+    fi
+    if ! is_loaded "$label"; then
+      printf '%s\n' "$label" >>"$STATE" 2>/dev/null || true
+    fi
+    exit 0
+    ;;
+  bootout)
+    target="${1:-}"
+    label="$(label_of "$target")"
+    if is_loaded "$label"; then
+      grep -vx "$label" "$STATE" >"$STATE.tmp" 2>/dev/null || true
+      mv "$STATE.tmp" "$STATE" 2>/dev/null || true
+    fi
+    echo "Could not find service \"$target\"" >&2
+    exit 113
+    ;;
+  *)
+    exit 0
+    ;;
+esac

@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "title": "Subtitle Studio",
+    "description": "Turns pick → transcribe → translate → burn → deliver → notify into one configurable local pipeline. Settings → Subtitle Studio has eight tabs: overview, engine, source and output, selection, prompts, quality and audio, schedule, diagnostics. Saving writes atomically and keeps unknown keys; run, plan, selftest and logs are all executed by the bundled engine/subtitle-run.",
+    "detail": "docs/DETAIL.md"
+  },
+  "ui": {
+    "f.notify.qqAppId": "QQ Bot AppID",
+    "h.notify.qqAppId": "AppID from the bot page on the open platform; not secret, stored in config.json",
+    "f.notify.qqOpenId": "Receiver's OpenID",
+    "h.notify.qqOpenId": "The openid in the open-platform event after the bot receives a message",
+    "f.notify.qqSecretService": "Keychain service",
+    "h.notify.qqSecretService": "Empty = subtitle-studio-qqbot; the keychain account is the saved AppID",
+    "f.notify.qqSecret": "AppSecret",
+    "h.notify.qqSecret": "Written to the system keychain only and never echoed. The account is the saved AppID, so save the config after changing the AppID.",
+    "notify.secretStateSaved": "Saved to keychain",
+    "notify.secretStateMissing": "Not configured",
+    "notify.secretStateEnv": "Provided by environment variable",
+    "notify.secretPlaceholder": "Paste AppSecret (keychain only)",
+    "notify.saveSecret": "Save secret",
+    "notify.sendTest": "Send test message",
+    "notify.secretEmpty": "Enter the AppSecret first",
+    "notify.secretSaved": "Secret saved to the keychain",
+    "notify.secretSaveFailed": "Failed to save the secret",
+    "notify.testSent": "Test message sent",
+    "notify.testSkipped": "Test message not sent",
+    "notify.testFailed": "Failed to send the test message",
+    "notify.testHint": "The test message uses the saved config",
+    "notify.noneHint": "No notifications will be sent",
+    "notify.openidHelp": "Paste the message JSON the bot received and I'll extract the openid",
+    "notify.openidToggle": "Extract openid from message",
+    "notify.extractOpenid": "Extract openid",
+    "notify.openidMissing": "No openid found",
+    "notify.openidFound": "openid filled in",
+    "notify.advanced": "Advanced: fall back to a custom send script"
+  }
+}

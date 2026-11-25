@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""字幕工坊（dsh-subtitle-studio）引擎入口。
+
+用法：
+  subtitle-run doctor   --config <cfg> [--json]
+  subtitle-run plan     --config <cfg> [--max N] [--only "<文件名>"] [--json]
+  subtitle-run run      --config <cfg> [--max N] [--only "<文件名>"] [--dry-run] [--json]
+  subtitle-run guard    --config <cfg> [--max N] [--json]
+  subtitle-run status   --config <cfg> [--json]
+  subtitle-run selftest --config <cfg> [--skip-translate] [--keep] [--json]
+  subtitle-run notify-test --config <cfg> [--json]
+
+退出码（DESIGN §4）：
+  0 正常（含无候选） 2 配置错误 3 依赖缺失 4 来源不可达 5 引擎调用失败
+  6 ffmpeg 失败 7 上传失败 8 磁盘不足 9 已有实例在跑
+
+--json 时 stdout 只输出一个 JSON 文档：
+  成功 {"ok": true, "data": {...}}
+  失败 {"ok": false, "error": {"code": "...", "message": "...", "exitCode": N}}
+所有进度/日志只写 stderr 与 logs/ 下的日志文件。
+"""
+
+import json
+import os
+import sys
+
+ENGINE_DIR = os.path.dirname(os.path.realpath(__file__))
+if ENGINE_DIR not in sys.path:
+    sys.path.insert(0, ENGINE_DIR)
+
+ENGINE_VERSION = "1.4.0"
+
+from lib import config as config_mod          # noqa: E402
+from lib import doctor as doctor_mod         # noqa: E402
+from lib import guard as guard_mod           # noqa: E402
+from lib import notify as notify_mod         # noqa: E402
+from lib import pipeline                     # noqa: E402
+from lib.runtime import (EngineError, Log, RunLock, expand,  # noqa: E402
+                         human_size, now_iso)
+
+ERROR_NAMES = {
+    1: "unexpected",
+    2: "config_error",
+    3: "missing_dependency",
+    4: "source_unreachable",
+    5: "engine_failed",
+    6: "ffmpeg_failed",
+    7: "upload_failed",
+    8: "disk_insufficient",
+    9: "already_running",
+}
+
+USAGE = """字幕工坊引擎 subtitle-run v%s
+
+用法：
+  subtitle-run doctor   --config <cfg> [--json]
+  subtitle-run plan     --config <cfg> [--max N] [--only "<文件名>"] [--json]
+  subtitle-run run      --config <cfg> [--max N] [--only "<文件名>"] [--dry-run] [--json]
+  subtitle-run guard    --config <cfg> [--max N] [--json]
+  subtitle-run status   --config <cfg> [--json]
+  subtitle-run selftest --config <cfg> [--skip-translate] [--keep] [--json]
+  subtitle-run notify-test --config <cfg> [--json]
+
+退出码：0 正常 / 2 配置错误 / 3 依赖缺失 / 4 来源不可达 / 5 引擎失败 /
+        6 ffmpeg 失败 / 7 上传失败 / 8 磁盘不足 / 9 已有实例在跑
+""" % ENGINE_VERSION
+
+
+# ---------------------------------------------------------------- 参数
+
+def parse_argv(argv):
+    command = None
+    opts = {}
+    flags = ("json", "dry_run", "skip_translate", "keep")
+    values = ("config", "max", "only")
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            opts["help"] = True
+            i += 1
+            continue
+        if arg in ("-V", "--version"):
+            opts["version"] = True
+            i += 1
+            continue
+        if arg.startswith("--"):
+            key, sep, raw = arg[2:].partition("=")
+            key = key.replace("-", "_")
+            if key in flags:
+                if sep:
+                    opts[key] = raw.lower() not in ("0", "false", "no", "")
+                else:
+                    opts[key] = True
+                i += 1
+                continue
+            if key in values:
+                if sep:
+                    opts[key] = raw
+                    i += 1
+                else:
+                    if i + 1 >= len(argv):
+                        raise EngineError(2, "参数 %s 缺少取值" % arg)
+                    opts[key] = argv[i + 1]
+                    i += 2
+                continue
+            raise EngineError(2, "未知参数：%s" % arg)
+        if command is None:
+            command = arg
+            i += 1
+            continue
+        raise EngineError(2, "多余的参数：%s" % arg)
+    return command, opts
+
+
+# ---------------------------------------------------------------- 输出
+
+def emit_json(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+def emit_ok(data):
+    emit_json({"ok": True, "data": data})
+
+
+def emit_error(exc):
+    code = getattr(exc, "code", 1) or 1
+    payload = {
+        "ok": False,
+        "error": {
+            "code": ERROR_NAMES.get(code, "error"),
+            "message": getattr(exc, "message", str(exc)),
+            "exitCode": code,
+        },
+    }
+    detail = getattr(exc, "detail", None)
+    if detail:
+        payload["error"]["detail"] = detail
+    emit_json(payload)
+
+
+def human_error(exc):
+    code = getattr(exc, "code", 1) or 1
+    sys.stderr.write("错误[%s %s]：%s\n" % (code, ERROR_NAMES.get(code, "error"),
+                                          getattr(exc, "message", str(exc))))
+    detail = getattr(exc, "detail", None)
+    if detail:
+        if isinstance(detail, (dict, list)):
+            detail = json.dumps(detail, ensure_ascii=False)
+        sys.stderr.write("  %s\n" % str(detail)[:1000])
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(cfg, opts):
+    log = Log(cfg.logs_dir, "doctor")
+    try:
+        data = doctor_mod.run_doctor(cfg)
+        for check in data["checks"]:
+            if check["level"] in ("error", "warn"):
+                log.warn("%s: %s" % (check["name"], check["message"]))
+            elif check["level"] == "ok":
+                log.info("%s: %s" % (check["name"], check["message"]))
+        log.info("doctor 结论：%s（%s）" % (data["verdict"], data["summary"]))
+    except EngineError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - doctor 自身不能崩
+        log.error("doctor 异常：%s" % exc)
+        raise
+
+    if opts.get("json"):
+        if data["verdict"] == "failed":
+            # 契约：doctor 进程退出码固定 0/1（见 DESIGN §4），具体失败项在 data.checks
+            emit_json({"ok": False, "data": data,
+                       "error": {"code": "doctor_failed",
+                                 "message": "doctor 发现 %d 个错误项" % data["summary"]["error"],
+                                 "exitCode": 1}})
+        else:
+            emit_ok(data)
+        return 1 if data["verdict"] == "failed" else 0
+
+    print("字幕工坊 doctor  v%s" % data["version"])
+    print("配置：%s" % data["configPath"])
+    print("数据：%s" % data["dataDir"])
+    print("引擎：%s / %s" % (data["engine"]["kind"], data["engine"]["model"]))
+    print("")
+    marks = {"ok": "OK  ", "warn": "WARN", "error": "FAIL", "info": "INFO"}
+    for check in data["checks"]:
+        print("[%s] %-24s %s" % (marks.get(check["level"], "????"),
+                                 check["name"], check["message"]))
+    summary = data["summary"]
+    print("")
+    print("结论：%s（ok=%d warn=%d error=%d info=%d）"
+          % (data["verdict"], summary["ok"], summary["warn"],
+             summary["error"], summary["info"]))
+    return 1 if data["verdict"] == "failed" else 0
+
+
+# ---------------------------------------------------------------- plan
+
+def _print_candidates(plan_data, limit=None):
+    counts = plan_data["selection"]["counts"]
+    quota = plan_data["quota"]
+    print("来源：%s" % plan_data["source"]["display"])
+    print("输出：%s" % plan_data["output"]["display"])
+    print("候选 %d，选中 %d，跳过 %d；配额 maxPerRun=%s 今日已用=%s 剩余=%s"
+          % (counts["total"], counts["selected"], counts["skipped"],
+             quota["maxPerRun"], quota["usedToday"], quota["remaining"]))
+    print("")
+    rows = plan_data["candidates"]
+    if limit:
+        rows = rows[:limit]
+    for cand in rows:
+        flag = "x" if cand["selected"] else " "
+        reason = "" if cand["selected"] else "  跳过：%s" % cand["reasonText"]
+        print(" [%s] %-6.2fGB  %-19s  %s%s"
+              % (flag, cand.get("sizeGB") or 0,
+                 (cand.get("mtimeISO") or "")[:19], cand["name"], reason))
+    if limit and len(plan_data["candidates"]) > limit:
+        print(" ...（共 %d 条，仅显示前 %d 条）" % (len(plan_data["candidates"]), limit))
+
+
+def cmd_plan(cfg, opts):
+    log = Log(cfg.logs_dir, "run")
+    max_override = _int_opt(opts, "max")
+    plan_data = pipeline.build_plan(cfg, log, max_override=max_override,
+                                    only=opts.get("only"))
+    if opts.get("json"):
+        emit_ok(plan_data)
+    else:
+        _print_candidates(plan_data)
+    return 0
+
+
+def _int_opt(opts, key):
+    if key not in opts:
+        return None
+    try:
+        value = int(opts[key])
+    except (TypeError, ValueError):
+        raise EngineError(2, "--%s 需要整数，收到：%s" % (key, opts[key]))
+    if value < 0:
+        raise EngineError(2, "--%s 不能为负数" % key)
+    return value
+
+
+# ---------------------------------------------------------------- run
+
+def _run_locked(cfg, log, max_override=None, only=None, mode="run"):
+    """拿锁 → build_plan → execute，返回 (payload, exit_code)。"""
+    lock = RunLock(cfg.state_dir)
+    if not lock.acquire({"mode": mode, "config": cfg.path}):
+        holder = lock.read_holder() or {}
+        raise EngineError(9, "已有实例在运行（pid=%s，startedAt=%s）"
+                          % (holder.get("pid"), holder.get("startedAt")),
+                          detail=lock.path)
+    try:
+        plan_data = pipeline.build_plan(cfg, log, max_override=max_override,
+                                        only=only)
+        payload = pipeline.execute(cfg, log, plan_data, dry_run=False,
+                                   notify_module=notify_mod)
+        return payload, pipeline.compute_exit_code(payload)
+    finally:
+        lock.release()
+
+
+def _print_run(payload, exit_code):
+    totals = payload["totals"]
+    print("本轮结束：选中 %d，成功 %d，跳过 %d，失败 %d"
+          % (totals["selected"], totals["ok"], totals["skipped"],
+             totals["failed"]))
+    for item in payload["results"]:
+        mark = {"ok": "OK  ", "skipped": "SKIP", "failed": "FAIL"}.get(
+            item["status"], "????")
+        extra = item.get("message") or item.get("output") or ""
+        print("[%s] %s  %s" % (mark, item["name"], extra))
+    if exit_code:
+        print("退出码：%d（%s）" % (exit_code, ERROR_NAMES.get(exit_code, "error")))
+
+
+def cmd_run(cfg, opts):
+    dry_run = bool(opts.get("dry_run"))
+    max_override = _int_opt(opts, "max")
+
+    if dry_run:
+        # 无副作用：不建目录、不写日志/状态、不拿锁
+        log = Log(None, "run")
+        plan_data = pipeline.build_plan(cfg, log, max_override=max_override,
+                                        only=opts.get("only"))
+        payload = pipeline.execute(cfg, log, plan_data, dry_run=True)
+        if opts.get("json"):
+            emit_ok(payload)
+        else:
+            print("dry-run：%d 个候选，将处理 %d 个"
+                  % (plan_data["selection"]["counts"]["total"],
+                     len(payload["actions"])))
+            for action in payload["actions"]:
+                print("  - %s（%sGB）→ %s" % (action["name"], action["sizeGB"],
+                                             action["expectedOutput"]))
+            print("  阶段：%s" % " → ".join(payload["actions"][0]["stages"])
+                  if payload["actions"] else "  （无选中文件）")
+            print("  说明：%s" % payload["note"])
+        return 0
+
+    log = Log(cfg.logs_dir, "run")
+    log.info("=== 字幕工坊 run 开始（pid=%s）===" % os.getpid())
+    payload, exit_code = _run_locked(cfg, log, max_override=max_override,
+                                     only=opts.get("only"))
+    if opts.get("json"):
+        emit_ok(payload)
+    else:
+        _print_run(payload, exit_code)
+    return exit_code
+
+
+# ---------------------------------------------------------------- guard
+
+def cmd_guard(cfg, opts):
+    """幂等日闸门：今天跑过就跳过，没跑过才跑一轮，结果落 state/guard-last.json。"""
+    log = Log(cfg.logs_dir, "guard")
+    status_data = pipeline.status(cfg)
+    decision = guard_mod.decide(status_data)
+    record = {
+        "at": now_iso(),
+        "action": decision["action"],
+        "reason": decision["reason"],
+        "reasonText": decision["reasonText"],
+        "today": decision["today"],
+        "lastRun": decision["lastRun"],
+        "configPath": cfg.path,
+    }
+
+    if decision["action"] == "skip":
+        log.info("guard 跳过：%s（今日 %s/%s）"
+                 % (decision["reasonText"], decision["today"]["count"],
+                    decision["today"]["maxPerRun"] or "不限"))
+        guard_mod.write_guard_last(cfg, record)
+        if opts.get("json"):
+            emit_ok(record)
+        else:
+            print("守卫跳过：%s（今日已处理 %s 条）"
+                  % (decision["reasonText"], decision["today"]["count"]))
+        return 0
+
+    max_override = _int_opt(opts, "max")
+    if max_override is None:
+        # 守卫永远只补一轮：未配 maxPerRun 时按 1 条兜底，避免失控批量
+        max_override = int(cfg.get("selection.maxPerRun") or 0) or 1
+    log.info("=== 字幕工坊 guard 开始（%s，max=%s）==="
+             % (decision["reasonText"], max_override))
+    try:
+        payload, exit_code = _run_locked(cfg, log, max_override=max_override,
+                                         mode="guard")
+    except EngineError as exc:
+        if exc.code == 9:  # 判定与拿锁之间被抢占：按跳过处理，不报错
+            record.update({"action": "skip", "reason": "already-running",
+                           "reasonText": guard_mod.REASON_TEXT["already-running"]})
+            guard_mod.write_guard_last(cfg, record)
+            log.warn("guard 让位：已有实例在运行")
+            if opts.get("json"):
+                emit_ok(record)
+            else:
+                print("守卫让位：已有实例在运行")
+            return 0
+        record.update({"action": "error",
+                       "error": {"code": exc.code,
+                                 "message": getattr(exc, "message", str(exc))}})
+        guard_mod.write_guard_last(cfg, record)
+        log.error("guard 执行失败：%s" % getattr(exc, "message", str(exc)))
+        raise
+
+    record["run"] = {
+        "runId": payload.get("runId"),
+        "startedAt": payload.get("startedAt"),
+        "finishedAt": payload.get("finishedAt"),
+        "totals": payload.get("totals"),
+        "exitCode": exit_code,
+    }
+    guard_mod.write_guard_last(cfg, record)
+    if opts.get("json"):
+        emit_ok(record)
+    else:
+        _print_run(payload, exit_code)
+    return exit_code
+
+
+
+# ---------------------------------------------------------------- status
+
+def cmd_status(cfg, opts):
+    data = pipeline.status(cfg)
+    if opts.get("json"):
+        emit_ok(data)
+        return 0
+    last = data.get("lastRun") or {}
+    totals = last.get("totals") or {}
+    print("运行中：%s" % ("是" if data["running"] else "否"))
+    if data.get("lock", {}).get("holder"):
+        holder = data["lock"]["holder"]
+        print("持有者：pid=%s 开始于 %s" % (holder.get("pid"), holder.get("startedAt")))
+    print("最近一次：%s → %s（选中 %s，成功 %s，失败 %s）"
+          % (last.get("startedAt") or "-", last.get("finishedAt") or "-",
+             totals.get("selected", 0), totals.get("ok", 0), totals.get("failed", 0)))
+    today = data["today"]
+    print("今日已处理：%s / %s（%s）"
+          % (today["count"], today["maxPerRun"] or "不限", today["date"]))
+    print("跳过名单：%d 条" % data["skipList"]["count"])
+    print("数据目录：%s" % data["paths"]["dataDir"])
+    print("日志：%s（%s）" % (data["logs"]["runLog"],
+                             human_size(data["logs"]["sizeBytes"] or 0)))
+    print("引擎：%s / %s" % (data["engine"]["kind"], data["engine"]["model"]))
+    if last.get("results"):
+        print("")
+        for item in last["results"][-10:]:
+            print("  [%s] %s %s" % (item.get("status"), item.get("name"),
+                                    item.get("message") or ""))
+    return 0
+
+
+# ---------------------------------------------------------------- selftest
+
+def cmd_selftest(cfg, opts):
+    lock = RunLock(cfg.state_dir)
+    if not lock.acquire({"mode": "selftest", "config": cfg.path}):
+        holder = lock.read_holder() or {}
+        raise EngineError(9, "已有实例在运行（pid=%s），自检需要独占"
+                          % holder.get("pid"), detail=lock.path)
+    try:
+        log = Log(cfg.logs_dir, "selftest")
+        log.info("=== selftest 开始 ===")
+        data = pipeline.selftest(cfg, log,
+                                 skip_translate=bool(opts.get("skip_translate")),
+                                 keep=bool(opts.get("keep")))
+        if opts.get("json"):
+            emit_ok(data)
+            return 0
+        print("自检完成：%d 步" % len(data["steps"]))
+        for index, step in enumerate(data["steps"], 1):
+            print("  %d. %s  %s" % (index, step["name"], step["detail"]))
+        print("")
+        print("成品：%s（%s）" % (data["artifact"], human_size(data["artifactBytes"])))
+        probe = data["ffprobe"]
+        video = probe.get("video") or {}
+        audio = probe.get("audio") or {}
+        print("ffprobe：%s %dx%d %.2fs，视频 %s，音频 %s，%s"
+              % (probe.get("formatName"), video.get("width") or 0,
+                 video.get("height") or 0, probe.get("durationSec") or 0,
+                 video.get("codec"), (audio.get("codec") or "-"),
+                 human_size(probe.get("sizeBytes") or 0)))
+        print("翻译：%s" % ("已跳过（--skip-translate）"
+                          if data["translate"].get("skipped")
+                          else "%s/%s，%d 条，中文=%s"
+                          % (data["translate"].get("engine"),
+                             data["translate"].get("model"),
+                             data["translate"].get("blocks") or 0,
+                             data["translate"].get("hasChinese"))))
+        return 0
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------- notify-test
+
+def cmd_notify_test(cfg, opts):
+    log = Log(cfg.logs_dir, "notify")
+    result = notify_mod.send(cfg, "通知测试",
+                             "如果你看到这条消息，说明字幕工坊的通知通道已配置成功。",
+                             log)
+    if opts.get("json"):
+        emit_ok(result)
+        return 0 if result.get("sent") else 1
+    if result.get("sent"):
+        print("通知已发送（渠道 %s，目标 %s）" % (result.get("channel"), result.get("target") or "-"))
+        return 0
+    print("通知未发送：%s（渠道 %s）" % (result.get("reason") or "未知原因", result.get("channel")))
+    return 1
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    as_json = "--json" in argv
+    try:
+        command, opts = parse_argv(argv)
+        if opts.get("version") or command == "version":
+            print("subtitle-run %s" % ENGINE_VERSION)
+            return 0
+        if opts.get("help") or command in (None, "help"):
+            print(USAGE)
+            return 0
+
+        handlers = {
+            "doctor": cmd_doctor,
+            "plan": cmd_plan,
+            "run": cmd_run,
+            "guard": cmd_guard,
+            "status": cmd_status,
+            "selftest": cmd_selftest,
+            "notify-test": cmd_notify_test,
+        }
+        if command not in handlers:
+            raise EngineError(2, "未知子命令：%s（可用：%s）"
+                              % (command, ", ".join(sorted(handlers))))
+
+        config_path = opts.get("config") or os.path.join(
+            expand("~/.dsh/data/subtitle-studio"), "config.json")
+        cfg = config_mod.load_config(config_path)
+        return handlers[command](cfg, opts)
+    except EngineError as exc:
+        if as_json:
+            emit_error(exc)
+        else:
+            human_error(exc)
+        return exc.code if exc.code in ERROR_NAMES else 1
+    except KeyboardInterrupt:
+        sys.stderr.write("已中断\n")
+        return 130
+    except Exception as exc:  # noqa: BLE001 - 入口兜底
+        error = EngineError(1, "%s: %s" % (type(exc).__name__, exc))
+        if as_json:
+            emit_error(error)
+        else:
+            human_error(error)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
