@@ -33,7 +33,9 @@ engine/
 | `mmx` CLI（仅 `engine.kind=minimax`） | 翻译 | doctor 报错 |
 | 用户自备的通知脚本（可选，`notify.qqSendPath`） | 通知 | 静默跳过 |
 
-除调度用的 `PATH` 兜底目录外，可执行文件路径都来自 `config.json`（`burn.ffmpeg` 等）或 `PATH`，
+除调度用的 `PATH` 兜底目录外，可执行文件路径来自 `config.json`（`burn.ffmpeg` 等）或 `PATH`；
+ffmpeg 例外地再多找一处 —— keg-only 的 `ffmpeg-full`（`brew --prefix ffmpeg-full`/opt/ffmpeg-full/bin 与两个
+常见前缀）不在 `PATH` 里，但它是 Homebrew 生态中唯一带 `ass`/`subtitles` 的那个，所以按「有没有滤镜」挑。显式配置的 `burn.ffmpeg` 仍然最高优先且不静默替换；一个都没滤镜时退回首选并只提示一次。
 不含任何用户机器专属的绝对路径。注意：凭据读取走 macOS 钥匙串（`security`），定时调度走 launchd，
 两者都是 macOS 专有的——本包不为其他系统改造，`package.json` 已声明 `os: ["darwin"]`；
 纯转写/翻译管线（`pipeline.py`、`vendor/*.py`）本身与操作系统无关，移植需要重做的是宿主与调度层。

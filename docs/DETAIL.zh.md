@@ -196,7 +196,7 @@ engine/subtitle-run selftest --config <cfg> [--skip-translate] [--keep] [--json]
 
 | 现象 | 处理 |
 | --- | --- |
-| 诊断里 `ffmpeg.filters` 失败 | Homebrew 的 `ffmpeg` 默认没带 libass：装 `ffmpeg-full`，或把 `burn.ffmpeg` 指到带 `ass`/`subtitles` 滤镜的二进制 |
+| 诊断里 `ffmpeg.filters` 失败 | 本机没有能烧字幕的 ffmpeg。Homebrew 的普通 `ffmpeg` 不带 libass，带的那个 `ffmpeg-full` 是 keg-only（不进 `PATH`）；插件已会自动找 `PATH`、`brew --prefix ffmpeg-full` 和两个常见前缀，还报这条就是三处都没有滤镜 —— 装 `ffmpeg-full`，或把 `burn.ffmpeg` 指到带该滤镜的二进制 |
 | `mlx_whisper` 警告 | `pip3 install --user mlx-whisper`；不用 Metal 可忽略，改用 CPU whisper |
 | Ollama 连不上 | 起 `ollama serve`，或把 `engine.ollamaHost` 指向实际地址 |
 | 点了运行没反应 | 看诊断里的锁状态；退出码 9 = 上一轮还在跑 |

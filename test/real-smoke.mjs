@@ -266,11 +266,26 @@ function buttons(tree) {
   return all
 }
 
+/**
+ * Tab labels double as content-button labels (「诊断」 is both a tab and the
+ * run-doctor button), and an action that finishes later can yank the tab with
+ * it — so tab clicks must never resolve to a content button. The tab bar
+ * renders before any card, so the *first* exact match is always the tab.
+ */
+function clickTab(tree, label) {
+  const target = buttons(tree).find((node) => String(node.text).trim() === label)
+  if (target === undefined) throw new Error(`tab not found: ${label}`)
+  target.props.onClick()
+}
+
 function click(tree, label) {
   const all = buttons(tree)
   const exact = all.filter((node) => String(node.text).trim() === label)
   const target = exact.length > 0 ? exact[exact.length - 1] : all.find((node) => String(node.text).includes(label))
-  if (target === undefined) throw new Error(`button not found: ${label}`)
+  if (target === undefined) {
+    const have = all.map((node) => String(node.text).trim()).filter(Boolean).slice(0, 40).join(' | ')
+    throw new Error(`button not found: ${label}  [have: ${have}]`)
+  }
   target.props.onClick()
 }
 
@@ -315,22 +330,54 @@ moduleExports.apply({
 })
 
 const panel = () => React.createElement(moduleExports.Panel)
-let tree = await render(panel)
-check('panel renders against the real engine', tree.text.includes('字幕工坊'))
 
-click(tree, '诊断')
-tree = await render(panel)
-check('doctor table renders the real check names', tree.text.includes('ffmpeg') && tree.text.includes('python'))
-check('doctor shows a real verdict', /通过|警告|失败|error|warn/.test(tree.text))
-check('doctor did not fall back to a failure banner', tree.text.includes('doctor failed') === false)
-check('doctor renders the engine message text', tree.text.includes('配置已加载') || tree.text.includes('ffmpeg'))
+/**
+ * The panel loads asynchronously and several actions jump to another tab when
+ * they finish, so "click once, render once" races the tab state. `settle`
+ * re-renders until the condition holds; the click itself is issued once, by
+ * the caller, before waiting. A timeout comes back as a failed check with the
+ * label it was waiting for, not as an exception that hides every later check.
+ */
+async function settle(root, condition, label) {
+  let tree = null
+  const deadline = Date.now() + 20000
+  while (Date.now() < deadline) {
+    tree = await render(root)
+    if (condition(tree)) return { tree, ok: true, label }
+    await sleep(120)
+  }
+  return { tree, ok: false, label }
+}
 
-click(tree, '概览')
-tree = await render(panel)
-click(tree, '只选片')
-tree = await render(panel)
-check('plan table renders the real candidates', tree.text.includes('a.mp4') || tree.text.includes('b.mkv'))
-check('plan shows skip reasons for undersized files', tree.text.includes('体积小于下限') || tree.text.includes('too-small'))
+const has = (needle) => (tree) => tree.text.includes(needle)
+const tabButton = (label) => (tree) => buttons(tree).some((node) => String(node.text).trim() === label)
+
+const opened = await settle(panel, has('字幕工坊'), 'panel renders')
+check('panel renders against the real engine', opened.ok, opened.label)
+const overviewReady = await settle(panel, tabButton('只选片'), 'overview run actions')
+check('the overview offers the run actions', overviewReady.ok, overviewReady.label)
+
+clickTab(overviewReady.tree, '诊断')
+const onDiagnose = await settle(panel, tabButton('刷新'), 'the diagnose tab')
+check('the diagnose tab is reachable by its own tab button', onDiagnose.ok, onDiagnose.label)
+
+click(onDiagnose.tree, '诊断')
+const diagnosed = await settle(panel, (tree) => has('ffmpeg')(tree) && has('python')(tree), 'doctor table with real check names')
+check('doctor table renders the real check names', diagnosed.ok, diagnosed.label)
+check('doctor shows a real verdict', /通过|警告|失败|error|warn/.test(diagnosed.tree.text))
+check('doctor did not fall back to a failure banner', diagnosed.tree.text.includes('doctor failed') === false)
+check('doctor renders the engine message text',
+      diagnosed.tree.text.includes('配置已加载') || diagnosed.tree.text.includes('ffmpeg'))
+
+clickTab(diagnosed.tree, '概览')
+const backOnOverview = await settle(panel, tabButton('只选片'), 'back on the overview')
+check('the overview is reachable again after the doctor finished', backOnOverview.ok, backOnOverview.label)
+
+click(backOnOverview.tree, '只选片')
+const planned = await settle(panel, (tree) => has('a.mp4')(tree) || has('b.mkv')(tree), 'plan table with real candidates')
+check('plan table renders the real candidates', planned.ok, planned.label)
+check('plan shows skip reasons for undersized files',
+      planned.tree.text.includes('体积小于下限') || planned.tree.text.includes('too-small'))
 
 server.close()
 const passed = results.filter(Boolean).length

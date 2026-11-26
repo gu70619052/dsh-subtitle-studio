@@ -3274,9 +3274,23 @@ window.__ModuleLoader__.load({
     const inject = ['slots', 'locale']
 
     function apply(ctx) {
+      /* 语言表的清理函数必须交回宿主：同一个页面里插件可以被重新激活
+       * （装包走 HMR、开关插件、换一份模块代际），而平台对「同一命名空间 +
+       * 同一语言」只允许注册一次，上一份没回收就再注册会直接抛。
+       * 这里既把 disposer 交回去，也不让注册失败把整个设置分区带走。 */
       ctx.effect(() => {
-        ctx.locale.register(NS, { zh: DICT_ZH, en: DICT_EN })
-      })
+        let release
+        try {
+          release = ctx.locale.register(NS, { zh: DICT_ZH, en: DICT_EN })
+        } catch (error) {
+          // 命名空间还被上一份未回收的客户端占着：字典内容完全一样，
+          // 复用它的即可 —— 面板照常渲染，只是这一次不拥有回收权。
+          console.warn(`[${NS}] locale register skipped: ${String(error?.message ?? error)}`)
+        }
+        return () => {
+          if (typeof release === 'function') release()
+        }
+      }, `${NS}: locale`)
       i18n.t = typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : (key) => DICT_ZH[key] ?? key
       ctx.slots.inject('settings.section', () =>
         ctx.slots.register(

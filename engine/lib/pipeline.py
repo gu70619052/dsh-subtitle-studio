@@ -45,6 +45,81 @@ class NoSpeech(Exception):
 
 # ==================================================================== 工具函数
 
+# Homebrew 的 `ffmpeg` 公式不带 libass（依赖里没有 libass，`--with-libass` 也已移除），
+# 带 ass/subtitles 的是 `ffmpeg-full`，而它是 keg-only：只落在 <brew --prefix>/opt/
+# ffmpeg-full/bin，不进 PATH。所以「which ffmpeg 命中不带 ass 的那个」是常态。
+FFMPEG_KEG_DIRS = (
+    "/opt/homebrew/opt/ffmpeg-full/bin",   # Apple Silicon 默认前缀
+    "/usr/local/opt/ffmpeg-full/bin",      # Intel 默认前缀
+)
+
+_FFMPEG_FILTER_CACHE = {}
+_BREW_KEG_LOOKUP_DONE = [False]
+_BREW_KEG_PATH = [None]
+_FFMPEG_FALLBACK_WARNED = [False]
+
+
+def _run_cmd_or_default(cmd, timeout):
+    """探测失败（含被测试替身接管）一律按「不确定」处理，不影响主流程。"""
+    try:
+        rc, out, _err = run_cmd(cmd, timeout=timeout)
+    except Exception:
+        return None
+    return (rc, out or "")
+
+
+def _brew_keg_ffmpeg():
+    """`brew --prefix ffmpeg-full` —— 兼容自定义 Homebrew 前缀。只查一次。"""
+    if _BREW_KEG_LOOKUP_DONE[0]:
+        return _BREW_KEG_PATH[0]
+    _BREW_KEG_LOOKUP_DONE[0] = True
+    probe = _run_cmd_or_default(["brew", "--prefix", "ffmpeg-full"], 15)
+    if probe is None or probe[0] != 0:
+        return None
+    prefix = (probe[1] or "").strip()
+    if not prefix or not os.path.isdir(prefix):
+        return None
+    candidate = os.path.join(prefix, "bin", "ffmpeg")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        _BREW_KEG_PATH[0] = candidate
+    return _BREW_KEG_PATH[0]
+
+
+def ffmpeg_has_subtitle_filters(binary):
+    """这个 ffmpeg 能不能烧字幕（ass + subtitles）。按路径缓存，只跑一次 -filters。"""
+    cached = _FFMPEG_FILTER_CACHE.get(binary)
+    if cached is not None:
+        return cached
+    probe = _run_cmd_or_default([binary, "-hide_banner", "-filters"], 60)
+    verdict = bool(probe) and probe[0] == 0 and \
+        re.search(r"\bass\b", probe[1]) is not None and \
+        re.search(r"\bsubtitles\b", probe[1]) is not None
+    _FFMPEG_FILTER_CACHE[binary] = verdict
+    return verdict
+
+
+def ffmpeg_candidates(cfg):
+    """按优先级给出可用的 ffmpeg 绝对路径（已过滤为存在且可执行）。"""
+    configured = expand(cfg.get("burn.ffmpeg") or "")
+    if configured:
+        return [configured]
+    ordered = []
+    seen = set()
+
+    def add(path):
+        if not path or path in seen:
+            return
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            seen.add(path)
+            ordered.append(path)
+
+    add(_brew_keg_ffmpeg())
+    add(shutil.which("ffmpeg"))
+    for directory in FFMPEG_KEG_DIRS:
+        add(os.path.join(directory, "ffmpeg"))
+    return ordered
+
+
 def ffmpeg_bin(cfg):
     configured = expand(cfg.get("burn.ffmpeg") or "")
     if configured:
@@ -52,11 +127,18 @@ def ffmpeg_bin(cfg):
             return configured
         raise EngineError(3, "config 指定的 ffmpeg 不存在或不可执行：%s" % configured,
                           detail="请检查 burn.ffmpeg（brew install ffmpeg-full）")
-    found = shutil.which("ffmpeg")
-    if not found:
+    candidates = ffmpeg_candidates(cfg)
+    if not candidates:
         raise EngineError(3, "找不到 ffmpeg（PATH 与 config.burn.ffmpeg 都没有）",
                           detail="安装 ffmpeg-full 或在 config.json 写绝对路径")
-    return found
+    for binary in candidates:
+        if ffmpeg_has_subtitle_filters(binary):
+            return binary
+    if len(candidates) > 1 and not _FFMPEG_FALLBACK_WARNED[0]:
+        _FFMPEG_FALLBACK_WARNED[0] = True
+        sys.stderr.write("[warn] 本机没有带 ass/subtitles 滤镜的 ffmpeg（压制会失败）："
+                         "brew install ffmpeg-full，或把 burn.ffmpeg 指向带该滤镜的二进制\n")
+    return candidates[0]
 
 
 def ffprobe_bin(cfg):

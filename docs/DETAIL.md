@@ -213,7 +213,7 @@ file exists it falls back to the output the plugin captured in memory for the cu
 
 | Symptom | Fix |
 | --- | --- |
-| `ffmpeg.filters` fails in diagnostics | Homebrew's plain `ffmpeg` ships without libass: install `ffmpeg-full`, or point `burn.ffmpeg` at a binary with the `ass`/`subtitles` filters |
+| `ffmpeg.filters` fails in diagnostics | No build on this machine can burn subtitles. Homebrew's plain `ffmpeg` has no libass and `ffmpeg-full` is keg-only (never in `PATH`); the plugin searches `PATH`, `brew --prefix ffmpeg-full` and the two common keg prefixes on its own, so this error means none of them had the filters — `brew install ffmpeg-full`, or point `burn.ffmpeg` at a binary that does |
 | `mlx_whisper` warning | `pip3 install --user mlx-whisper`; a CPU whisper build is fine to ignore it |
 | Ollama unreachable | start `ollama serve`, or point `engine.ollamaHost` at the real address |
 | Run seems to do nothing | check the lock in Diagnostics; exit code 9 means the previous round is still running |

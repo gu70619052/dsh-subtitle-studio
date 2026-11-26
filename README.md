@@ -42,11 +42,11 @@ where you got it:
 plugin_manager install_bundle  target: dsh-subtitle-studio
 
 # 2. from the published release tarball — no npm account anywhere
-plugin_manager install_bundle  target: https://github.com/gu70619052/dsh-subtitle-studio/releases/download/v1.4.0/dsh-subtitle-studio.tgz
+plugin_manager install_bundle  target: https://github.com/gu70619052/dsh-subtitle-studio/releases/download/v1.4.1/dsh-subtitle-studio.tgz
 
 # 3. from a clone: build the same tarball, or link the checkout
 npm pack                                   # writes dsh-subtitle-studio-<version>.tgz
-plugin_manager install_bundle  target: ./dsh-subtitle-studio-1.4.0.tgz
+plugin_manager install_bundle  target: ./dsh-subtitle-studio-1.4.1.tgz
 #    …or: cd dsh-subtitle-studio && npm link
 
 plugin_manager set_plugin      target: include:subtitle-studio  enabled: true
@@ -155,8 +155,10 @@ run: the engine logs one line and translates without it.
 
 ## Requirements
 
-- **ffmpeg** with libass — Homebrew's plain `ffmpeg` lacks the `ass`/`subtitles` filters; install `ffmpeg-full`, or
-  point `burn.ffmpeg` at a binary that has them.
+- **ffmpeg** with libass — Homebrew's plain `ffmpeg` formula no longer carries it, and the formula that does
+  (`ffmpeg-full`) is keg-only: it lands in `<brew --prefix>/opt/ffmpeg-full/bin` and is never linked into
+  `PATH`. The engine searches both places and uses the first build that actually has the `ass`/`subtitles`
+  filters; set `burn.ffmpeg` only if you keep the binary somewhere unusual.
 - **mlx_whisper** (`pip3 install --user mlx-whisper`) for Metal-accelerated transcription; a CPU `faster_whisper` build
   works too, more slowly.
 - A model configured in DSH, if you use the default `DSH` engine kind.
@@ -177,9 +179,9 @@ cd test
 node e2e.mjs                                      # host bridge + relay, 135 checks
 python3 multi_dir_test.py                         # multi-directory engine, 29 checks
 python3 quality_test.py                           # line wrapping, audio, scheduler symmetry, 25 checks
-python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, 77 checks
-node ui-smoke.mjs                                 # panel render, 129 checks
-node real-smoke.mjs                               # real engine against a fake HOME, 19 checks
+python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, ffmpeg resolution, 85 checks
+node ui-smoke.mjs                                 # panel render, locale re-activation, 134 checks
+node real-smoke.mjs                               # real engine against a fake HOME, 22 checks
 bash release-gate.sh                              # publish checklist: privacy greps, syntax,
 #   docs, then all five suites above. Exit 0 means publishable.
 ```

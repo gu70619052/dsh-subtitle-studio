@@ -472,17 +472,40 @@ globalThis.window.__ModuleLoader__ = {
 
 await import(pathToFileURL(path.join(PACKAGE, 'client.js')).href)
 
+const localeSlots = new Map()
+const localeDisposers = []
+
+/** Mirrors LocaleRuntime.register: a namespace may hold each locale only once. */
+function fakeRegister(namespace, strings) {
+  let locales = localeSlots.get(namespace)
+  if (locales === undefined) {
+    locales = new Map()
+    localeSlots.set(namespace, locales)
+  }
+  for (const locale of Object.keys(strings)) {
+    if (locales.has(locale)) {
+      throw new Error(`locale namespace "${namespace}" already has locale "${locale}"`)
+    }
+  }
+  for (const [locale, entries] of Object.entries(strings)) locales.set(locale, entries)
+  dict.zh = strings.zh
+  dict.en = strings.en
+  registered.push(namespace)
+  return () => {
+    for (const [locale, entries] of Object.entries(strings)) {
+      if (locales.get(locale) === entries) locales.delete(locale)
+    }
+  }
+}
+
 const clientCtx = {
   effect(fn) {
-    return fn()
+    const release = fn()
+    if (typeof release === 'function') localeDisposers.push(release)
+    return release
   },
   locale: {
-    register(namespace, strings) {
-      dict.zh = strings.zh
-      dict.en = strings.en
-      registered.push(namespace)
-      return () => {}
-    },
+    register: fakeRegister,
     bind(namespace) {
       return (key) => dict[activeLang][key] ?? key
     },
@@ -510,6 +533,31 @@ function check(name, condition, detail = '') {
 }
 
 check('module registers two locales', registered.includes('dsh-subtitle-studio') === true && dict.zh !== null && dict.en !== null)
+
+/* Re-activation used to drop the whole plugin: the client registered its
+ * namespace without handing the cleanup back, so a second apply inside the
+ * same page met a namespace that still held "zh". */
+function tryApply() {
+  try {
+    moduleExports.apply(clientCtx)
+    return null
+  } catch (error) {
+    return String(error?.message ?? error)
+  }
+}
+
+check(
+  'locale registration hands its cleanup back to the host',
+  localeDisposers.length === 1 && typeof localeDisposers[0] === 'function',
+  `${localeDisposers.length} disposers`,
+)
+for (const release of localeDisposers.splice(0)) release()
+const afterDispose = tryApply()
+check('re-activating after the host disposed the first one is clean', afterDispose === null, String(afterDispose))
+check('the second activation re-registers both locales', registered.filter((id) => id === 'dsh-subtitle-studio').length === 2, `${registered.length} registrations`)
+const stale = tryApply()
+check('a namespace left behind by a undisposed generation degrades instead of throwing', stale === null, String(stale))
+check('a degraded re-registration still resolves panel text', (dict[activeLang]['nav'] ?? '') === '字幕工坊', String(dict[activeLang]?.nav))
 check('locale keys are in parity', Object.keys(dict.zh).length === Object.keys(dict.en).length, `${Object.keys(dict.zh).length}/${Object.keys(dict.en).length}`)
 check('section registered at settings.section', moduleExports.section?.name === 'settings.section' && moduleExports.section?.order >= 40)
 check('section label is localized', typeof moduleExports.section?.label === 'function' && moduleExports.section.label() === '字幕工坊')

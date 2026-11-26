@@ -21,7 +21,7 @@ from lib.remote import Endpoint, tcp_probe
 from lib.runtime import (EngineError, df_avail_bytes, ensure_dir, expand, file_size,
                          human_size, now_iso, read_text, run_cmd)
 
-ENGINE_VERSION = "1.4.0"
+ENGINE_VERSION = "1.4.1"
 SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|tvly-[A-Za-z0-9_\-]{8,})")
 
 
@@ -116,7 +116,9 @@ def check_ffmpeg(checks, cfg):
                if not re.search(r"\b%s\b" % name, filters)]
     if missing:
         checks.error("ffmpeg.filters", "deps",
-                     "ffmpeg 缺少必需滤镜/源：%s（需要 ffmpeg-full）" % ", ".join(missing))
+                     "ffmpeg 缺少必需滤镜/源：%s（需要 ffmpeg-full）" % ", ".join(missing),
+                     {"hint": "brew install ffmpeg-full（keg-only，不在 PATH；"
+                              "插件已会自动找它，找不到才报这条）"})
     else:
         checks.ok("ffmpeg.filters", "deps", "ass/subtitles/testsrc2/sine 均可用")
 

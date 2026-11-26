@@ -12,6 +12,7 @@
 6. 新配置键的校验规则。
 """
 
+import io
 import json
 import os
 import shutil
@@ -636,6 +637,104 @@ def test_dry_run_follows_output_mode():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_ffmpeg_resolution():
+    """REQ-47：ffmpeg-full 是 keg-only、不进 PATH，插件必须自己找到带 ass 的那个。"""
+    tmp = tempfile.mkdtemp(prefix="ffmpeg-cand-")
+    keg_dir = os.path.join(tmp, "keg-only", "bin")     # 模拟 <prefix>/opt/ffmpeg-full/bin
+    path_dir = os.path.join(tmp, "in-path", "bin")     # 模拟 which("ffmpeg") 命中的普通 ffmpeg
+    os.makedirs(keg_dir)
+    os.makedirs(path_dir)
+    keg = os.path.join(keg_dir, "ffmpeg")
+    plain = os.path.join(path_dir, "ffmpeg")
+    for binary in (keg, plain):
+        io.open(binary, "w", encoding="utf-8").write("#!/bin/sh\nexit 0\n")
+        os.chmod(binary, 0o755)
+    probe = os.path.join(keg_dir, "ffprobe")
+    io.open(probe, "w", encoding="utf-8").write("#!/bin/sh\nexit 0\n")
+    os.chmod(probe, 0o755)
+
+    saved = {
+        "cache": dict(pipeline._FFMPEG_FILTER_CACHE),
+        "brew_done": pipeline._BREW_KEG_LOOKUP_DONE[0],
+        "brew_path": pipeline._BREW_KEG_PATH[0],
+        "keg_dirs": pipeline.FFMPEG_KEG_DIRS,
+        "which": pipeline.shutil.which,
+        "run_cmd": pipeline.run_cmd,
+        "warned": pipeline._FFMPEG_FALLBACK_WARNED[0],
+    }
+    probes = []
+
+    def fake_which(name, *args, **kwargs):
+        if name == "ffmpeg":
+            return plain
+        return saved["which"](name, *args, **kwargs)
+
+    def fake_run_cmd(cmd, timeout=None, **kwargs):
+        probes.append(cmd[0])
+        # 只有 keg-only 那个带 ass/subtitles（普通 Homebrew ffmpeg 没有）
+        if cmd[0] == keg:
+            return (0, " .. ass            -> VV->V\n .. subtitles      -> VS->V\n", "")
+        return (0, " .. volume          -> AV->AV\n", "")
+
+    try:
+        pipeline.shutil.which = fake_which
+        pipeline.run_cmd = fake_run_cmd
+        pipeline.FFMPEG_KEG_DIRS = (keg_dir,)
+        pipeline._BREW_KEG_LOOKUP_DONE[0] = True     # 不依赖本机是否装了 brew
+        pipeline._BREW_KEG_PATH[0] = None
+        cfg = FlatConfig({"burn": {"ffmpeg": ""}})
+
+        ordered = pipeline.ffmpeg_candidates(cfg)
+        check("REQ-47 候选顺序：PATH 在前、keg-only 在后（顺序本身不藏东西）",
+              ordered == [plain, keg], str(ordered))
+
+        pipeline._FFMPEG_FILTER_CACHE.clear()
+        probes[:] = []
+        first = pipeline.ffmpeg_bin(cfg)
+        second = pipeline.ffmpeg_bin(cfg)
+        check("REQ-47 被选中的是有 ass 滤镜的那个，哪怕它排在后面", first == keg, first)
+        check("REQ-47 滤镜探测按路径缓存，第二次不再跑 -filters",
+              second == keg and probes == [plain, keg], str(probes))
+        check("REQ-47 ffprobe 取被选中 ffmpeg 的同目录",
+              pipeline.ffprobe_bin(cfg) == probe, pipeline.ffprobe_bin(cfg))
+
+        pipeline._FFMPEG_FILTER_CACHE.clear()
+        pipeline._FFMPEG_FILTER_CACHE[plain] = False
+        pipeline._FFMPEG_FILTER_CACHE[keg] = False
+        pipeline._FFMPEG_FALLBACK_WARNED[0] = False
+        stderr_saved = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            picked = pipeline.ffmpeg_bin(cfg)
+            again = pipeline.ffmpeg_bin(cfg)
+            note = sys.stderr.getvalue()
+        finally:
+            sys.stderr = stderr_saved
+        check("REQ-47 一个带 ass 的都没有时退回首选，不悄悄换路径",
+              picked == plain and again == plain, picked)
+        check("REQ-47 这种退化只提示一次", note.count("没有带 ass/subtitles 滤镜") == 1,
+              repr(note[:70]))
+
+        check("REQ-47 显式配置的 burn.ffmpeg 仍然最高优先，即便它没有 ass",
+              pipeline.ffmpeg_bin(FlatConfig({"burn": {"ffmpeg": plain}})) == plain, "")
+        try:
+            pipeline.ffmpeg_bin(FlatConfig({"burn": {"ffmpeg": os.path.join(tmp, "ghost")}}))
+            check("REQ-47 显式路径不存在仍然硬失败", False, "没有抛错")
+        except pipeline.EngineError as exc:
+            check("REQ-47 显式路径不存在仍然硬失败", exc.code == 3, "code=%s" % exc.code)
+    finally:
+        pipeline._FFMPEG_FILTER_CACHE.clear()
+        for key, value in saved["cache"].items():
+            pipeline._FFMPEG_FILTER_CACHE[key] = value
+        pipeline._BREW_KEG_LOOKUP_DONE[0] = saved["brew_done"]
+        pipeline._BREW_KEG_PATH[0] = saved["brew_path"]
+        pipeline.FFMPEG_KEG_DIRS = saved["keg_dirs"]
+        pipeline.shutil.which = saved["which"]
+        pipeline.run_cmd = saved["run_cmd"]
+        pipeline._FFMPEG_FALLBACK_WARNED[0] = saved["warned"]
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     test_style_templates()
     test_output_mode()
@@ -649,6 +748,7 @@ def main():
     test_ass_style_switch()
     test_srt_mode_delivers_bilingual()
     test_dry_run_follows_output_mode()
+    test_ffmpeg_resolution()
     print("")
     print("%d/%d checks passed" % (len(PASSED), len(PASSED) + len(FAILURES)))
     if FAILURES:
