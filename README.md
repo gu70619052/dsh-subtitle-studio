@@ -69,7 +69,13 @@ Then open **Settings → Subtitle Studio**. Nothing is configured on first load,
    picture, **Subtitle file only** leaves the picture alone and writes a `.srt` next to it (the name follows
    your template, with the extension swapped).
 3. **Selection** tab → set how many files a round may consume (`maxPerRun`), which ones to skip because they are
-   already translated, and the size/age limits that stop it from picking a 40 GB remaster.
+   already translated, and the size/age limits that stop it from picking a 40 GB remaster. "Already translated"
+   follows the *source* file, not just the output folder, so changing the output folder or switching between
+   burning and subtitle-only does not re-translate the library.
+
+The very first time you open the panel (no `config.json` yet) the Overview tab shows a five-step checklist —
+dependencies, model, folders, a dry run, the optional schedule — ticked against what is actually configured, with a
+button on each unfinished step that opens the tab it belongs to.
 4. **Overview** tab → press **Plan only** first. It lists what would be processed and what was skipped, and why,
    without touching a file. Then **Run now** with **dry run** ticked, then untick it.
 
@@ -81,13 +87,64 @@ a fix hint for each row.
 | Tab | |
 | --- | --- |
 | Overview | run / plan / selftest, dependency check, last run |
-| Engine | kind (`DSH` / MiniMax / Ollama / DeepSeek / OpenAI-compatible), provider + model picker, sampling, batch size |
+| Engine | kind (`DSH` / MiniMax / Ollama / DeepSeek / OpenAI-compatible), provider + model picker, reasoning mode, sampling, batch size |
 | Source and output | a list of source→output directory pairs, each with its own include patterns, name template and overwrite policy, plus one global output mode (burn into the video, or subtitle file only) |
 | Selection | per-round cap, skip already translated, size and age limits, ordering, exclude patterns |
 | Prompts | a default system/context prompt plus profiles matched by filename glob |
 | Quality and audio | bilingual subtitles, silence trimming, line length, subtitle style preset, burn settings, whisper model and language, plus the anti-hallucination knobs (carry the previous text as context — off by default, temperature fallback ceiling, confidence floor, keep/drop end cards and repeats) |
 | Schedule | `launchd` at a fixed time, a pasteable DSH task prompt, or off |
 | Diagnostics | every `doctor` check, engine status, log tailing |
+
+### Already-translated files are remembered
+
+A finished file is recorded in `state/translated.json` the moment it is written: the
+source name (tagged with its directory when you watch several folders), the file that
+came out, the output mode and the time. The next round consults that record *before* it
+looks in the output folder, which is what makes changing the output folder or switching
+between **Burn into video** and **Subtitle file only** a safe thing to do.
+
+A record is a claim, not a fact, so the folder is listed once more before it is trusted:
+if the product was deleted, the file counts as untranslated and the plan says so. The
+reason column distinguishes the two cases — `translated-exists` (the expected name is
+right there) and `translated-ledger` (a record from an earlier round, product still
+present) — and both carry the path they were verified against. `Force` re-translates
+either way; the record list is capped at 5000 entries, oldest evicted first.
+
+With source and output pointed at the same folder, a file that matches your name
+template and already lives in the output folder is skipped as `own-output` instead of
+being translated into `X_zh_zh.mp4`. Turn `selection.skipOwnOutputs` off if you really do
+name your sources that way.
+
+### When a dependency is missing
+
+`doctor` runs on activation and its rows are on the Overview tab. Rows with a known fix
+get an **Install · <command>** button: ffmpeg (via `ffmpeg-full`), `mlx-whisper` or
+`faster-whisper` for the transcription engine you picked, and the MiniMax bridge. The
+button runs exactly one command from a fixed table after a confirmation, then re-runs the
+check and shows the result inline. Nothing else can be installed this way — the panel
+sends an action id, never a command — and a scheduled round never installs anything.
+
+A whisper *model* has no button on purpose: those weights are a multi-gigabyte download,
+so the row tells you the command and leaves the decision to you.
+
+### When a thinking model runs out of budget
+
+A model that "thinks" spends the same `maxTokens` pool on reasoning before it writes
+anything, so a batch that fits comfortably in a non-thinking model can be cut off
+mid-answer. This build treats that as data, not as a failed call:
+
+- the panel's **Reasoning mode** picker lists the levels the model itself declares
+  (leave it on *follow the model's default* and the key is not sent at all);
+- a level the model does not have is refused *before* the request is billed
+  (`422 unknown-effort`), and a provider that is throttling says so
+  (`429 rate-limited`) instead of arriving as a generic error;
+- the relay returns the text that was written before the cut, with
+  `usage.reasoningTokens` telling you how much of the budget went to thinking;
+- the translator keeps every block it can match by timestamp and re-asks only the
+  missing ones, in halves, with depth and call caps;
+- what still cannot be translated keeps the source line, and each run writes
+  `<output>.report.json` (calls, split retries, truncated/failed batches, token
+  split, untranslated ids) which the run result and the notification surface too.
 
 ## Data and privacy
 
@@ -98,7 +155,7 @@ Everything lives under `~/.dsh/data/subtitle-studio/`:
 | `config.json` | your settings, as plain JSON you can read and edit |
 | `logs/` | `run-<id>.log` per round, `host.log` for bridge-level failures |
 | `series/` | glossary files **you** add; read-only for the engine, never uploaded anywhere |
-| `state/` | run lock, last-run summary, schedule record, cached self-check, relay endpoint + token |
+| `state/` | run lock, last-run summary, schedule record, cached self-check, relay endpoint + token, `translated.json` (what has been produced) and `skipped.json` (files that failed) |
 | `work/` | intermediate transcription and translation artifacts, per source file |
 
 - Secrets are never stored by this plugin. `engine.apiKeyRef` holds the **name** of a keychain entry or environment
@@ -176,14 +233,16 @@ run: the engine logs one line and translates without it.
 node --check index.js && node --check client.js   # syntax
 python3 -m compileall -q engine                   # syntax
 cd test
-node e2e.mjs                                      # host bridge + relay, 135 checks
+node e2e.mjs                                      # host bridge + relay + one-click installs, 165 checks
 python3 multi_dir_test.py                         # multi-directory engine, 29 checks
 python3 quality_test.py                           # line wrapping, audio, scheduler symmetry, 25 checks
 python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, ffmpeg resolution, 85 checks
-node ui-smoke.mjs                                 # panel render, locale re-activation, 134 checks
+python3 v15_test.py                               # reasoning effort, truncated batches, split retries, error classification, 30 checks
+python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 63 checks
+node ui-smoke.mjs                                 # panel render, locale re-activation, reasoning picker, first-run checklist, 154 checks
 node real-smoke.mjs                               # real engine against a fake HOME, 22 checks
 bash release-gate.sh                              # publish checklist: privacy greps, syntax,
-#   docs, then all five suites above. Exit 0 means publishable.
+#   docs, then every suite above. Exit 0 means publishable.
 ```
 
 `e2e.mjs` and `ui-smoke.mjs` run the real host and client modules against a sandboxed `HOME`, a mock engine and a

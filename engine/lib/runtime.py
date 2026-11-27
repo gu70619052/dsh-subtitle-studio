@@ -105,21 +105,35 @@ def read_text(path):
         return f.read()
 
 
-def atomic_write_text(path, text):
-    """先写 <path>.partial 再 rename，保证读到的是完整文件。"""
+def atomic_write_text(path, text, mode=None):
+    """先写 <path>.partial 再 rename，保证读到的是完整文件。
+
+    mode 给定时顺带收紧权限。state/ 下的名单与台账写的是用户看哪些片子，
+    属于「不该给同机其他用户读」的内容，所以调用方传 0o600。
+    """
     directory = os.path.dirname(os.path.abspath(path))
     ensure_dir(directory)
     tmp = path + ".partial"
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
     return path
 
 
-def atomic_write_json(path, obj):
-    return atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+def atomic_write_json(path, obj, mode=None):
+    return atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode=mode)
 
 
 def read_json(path, default=None):

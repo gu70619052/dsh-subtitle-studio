@@ -29,7 +29,7 @@ ENGINE_DIR = os.path.dirname(os.path.realpath(__file__))
 if ENGINE_DIR not in sys.path:
     sys.path.insert(0, ENGINE_DIR)
 
-ENGINE_VERSION = "1.4.1"
+ENGINE_VERSION = "1.6.0"
 
 from lib import config as config_mod          # noqa: E402
 from lib import doctor as doctor_mod         # noqa: E402
@@ -226,7 +226,7 @@ def cmd_plan(cfg, opts):
     log = Log(cfg.logs_dir, "run")
     max_override = _int_opt(opts, "max")
     plan_data = pipeline.build_plan(cfg, log, max_override=max_override,
-                                    only=opts.get("only"))
+                                    only=opts.get("only"), write_state=False)
     if opts.get("json"):
         emit_ok(plan_data)
     else:
@@ -248,6 +248,23 @@ def _int_opt(opts, key):
 
 # ---------------------------------------------------------------- run
 
+def _notify_run_failure(cfg, log, exc):
+    """选片阶段就炸（NAS 掉线、目录读不出）也得出声。
+
+    夜跑由 launchd 触发，没人看 stderr；README 的运维口径是失败「由引擎通知与
+    任务回报暴露」，而 build_plan 在 execute 之前抛错时通知块根本跑不到（R3）。
+    拿锁失败（code 9）不补发：那是另一个实例正在干活，重复提醒只是噪音。
+    """
+    if exc.code == 9 or notify_mod is None:
+        return
+    try:
+        if notify_mod.should_notify(cfg, "failure"):
+            notify_mod.send(cfg, "处理有失败",
+                            "本轮未能开始：%s" % (exc.message or "")[:300], log)
+    except Exception:  # noqa: BLE001 - 通知自身坏了不能改退出码
+        pass
+
+
 def _run_locked(cfg, log, max_override=None, only=None, mode="run"):
     """拿锁 → build_plan → execute，返回 (payload, exit_code)。"""
     lock = RunLock(cfg.state_dir)
@@ -262,6 +279,9 @@ def _run_locked(cfg, log, max_override=None, only=None, mode="run"):
         payload = pipeline.execute(cfg, log, plan_data, dry_run=False,
                                    notify_module=notify_mod)
         return payload, pipeline.compute_exit_code(payload)
+    except EngineError as exc:
+        _notify_run_failure(cfg, log, exc)
+        raise
     finally:
         lock.release()
 
@@ -288,7 +308,7 @@ def cmd_run(cfg, opts):
         # 无副作用：不建目录、不写日志/状态、不拿锁
         log = Log(None, "run")
         plan_data = pipeline.build_plan(cfg, log, max_override=max_override,
-                                        only=opts.get("only"))
+                                        only=opts.get("only"), write_state=False)
         payload = pipeline.execute(cfg, log, plan_data, dry_run=True)
         if opts.get("json"):
             emit_ok(payload)

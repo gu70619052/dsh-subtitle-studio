@@ -388,9 +388,14 @@ window.__ModuleLoader__.load({
       'o.manualModel': ['手动填写 / 其他引擎…', 'Manual entry / other engines…'],
       'o.manualPlaceholder': ['填模型名，或先展开下方「高级」换引擎', 'Type a model name, or open Advanced below to switch engine'],
       'o.groupDsh': ['DSH 配置', 'DSH models'],
+      'o.reasoningDefault': ['跟随模型默认', "Follow the model's default"],
+      'o.reasoningOther': ['手填档位…', 'Type an effort id…'],
       'o.groupOllama': ['Ollama（本机）', 'Ollama (local)'],
       'act.refreshOllama': ['刷新 Ollama 模型', 'Refresh Ollama models'],
       'ov.ollamaCount': ['本机模型数', 'Local models'],
+      'ov.modelInfoLoading': ['正在问模型支持哪些档位…', 'Checking the efforts this model declares…'],
+      'ov.reasoningMismatch': ['档位 {effort} 不在这个模型声明的档位里，运行时会每一批都被拒', 'This model does not declare the effort {effort}; every batch would be refused'],
+      'ov.reasoningUndeclared': ['该模型未声明思考档位', 'This model declares no reasoning efforts'],
       'f.engine.ollamaModel': ['Ollama 覆盖模型', 'Ollama override model'],
       'ov.ollamaOverride': ['历史覆盖模型（只有上方没选到模型时才生效）',
         'Legacy override model (only used when the picker above is empty)'],
@@ -553,6 +558,7 @@ window.__ModuleLoader__.load({
       'f.engine.seed': ['随机种子', 'Seed'],
       'f.engine.maxTokens': ['最大输出 token', 'Max tokens'],
       'f.engine.batchSize': ['每次批量条数', 'Batch size'],
+      'f.engine.reasoningEffort': ['思考模式', 'Reasoning mode'],
       'f.engine.ollamaHost': ['Ollama 地址', 'Ollama host'],
       'f.engine.baseUrl': ['接口地址（OpenAI 兼容）', 'Base URL (OpenAI-compatible)'],
       'f.engine.apiKeyRef': ['钥匙串条目名', 'Keychain item'],
@@ -588,6 +594,11 @@ window.__ModuleLoader__.load({
       'f.selection.maxAgeDays': ['最大天数', 'Max age (days)'],
       'f.selection.order': ['排序', 'Order'],
       'f.selection.excludePatterns': ['排除规则', 'Exclude patterns'],
+      'f.selection.skipOwnOutputs': ['跳过自家成品', 'Skip own output'],
+      'h.selection.skipOwnOutputs': [
+        '来源目录和输出目录一样时，按文件名模板认出自家的成品（如 xxx_zh.mp4）并排掉，避免把成品再翻一遍变成 xxx_zh_zh.mp4。',
+        'When source and output are the same folder, files that look like this plugin\'s own output (xxx_zh.mp4) are skipped instead of being translated again into xxx_zh_zh.mp4.',
+      ],
       'f.prompts.default.system': ['系统提示词', 'System prompt'],
       'f.prompts.default.context': ['上下文', 'Context'],
       'f.prompts.profiles': ['按文件名匹配', 'Filename profiles'],
@@ -606,6 +617,11 @@ window.__ModuleLoader__.load({
       'f.transcribe.language': ['源语言', 'Source language'],
       'f.transcribe.keepAudio': ['保留中间音频', 'Keep audio'],
       'f.notify.channel': ['通知渠道', 'Channel'],
+      'f.notify.successWhen': ['算作成功的条件', 'Count as success when'],
+      'h.notify.successWhen': [
+        '整轮成功：一次跑完没有任何失败才发成功通知（旧行为）。有产出就算成功：哪怕只有一部成功也发成功，失败的那几部另发一条失败通知。',
+        'Whole run: only a run with zero failures reports success. Any output: success is reported as soon as one file came out, and the failures get their own message.',
+      ],
       'f.notify.onStart': ['开始时通知', 'Notify on start'],
       'f.notify.onSuccess': ['成功时通知', 'Notify on success'],
       'f.notify.onFailure': ['失败时通知', 'Notify on failure'],
@@ -674,6 +690,10 @@ window.__ModuleLoader__.load({
         'A keychain item name only; the secret itself never enters the config.',
       ],
       'h.engine.temperature': ['范围 0 – 2', 'Range 0 – 2'],
+      'h.engine.reasoningEffort': [
+        '截断通常不是模型不行，而是思考把输出预算吃光了。留空 = 跟随 DSH 给这个模型配的默认档位；关掉它，同样的 maxTokens 就能多出正文。',
+        'Truncation is usually thinking eating the output budget. Empty follows whatever DSH configured; turning it off leaves more of maxTokens for the body.',
+      ],
       'h.burn.fontSize': ['0 表示按视频高度自动', '0 means automatic from video height'],
       'h.selection.maxPerRun': ['0 表示不限制', '0 means unlimited'],
       'h.output.nameTemplate': ['必须含 {stem}，可加 {lang} 等占位', 'Must contain {stem}; other placeholders allowed'],
@@ -720,6 +740,8 @@ window.__ModuleLoader__.load({
       'o.off': ['关闭', 'Off'],
       'o.qqbot': ['QQ Bot', 'QQ Bot'],
       'o.none': ['不通知', 'No notification'],
+      'o.run': ['整轮成功才算', 'Whole run only'],
+      'o.anyOutput': ['有产出就算成功', 'Any output'],
       'o.command': ['执行命令', 'Run command'],
       'o.webhook': ['Webhook', 'Webhook'],
       'o.src.bundled': ['内置（插件自带）', 'Bundled'],
@@ -740,6 +762,7 @@ window.__ModuleLoader__.load({
       'ov.scSummary': ['检查项', 'Checks'],
       'ov.scAllGood': ['依赖齐全，没有告警', 'All dependencies present, no warnings'],
       'act.recheck': ['重新自检', 'Re-check'],
+      'act.fixing': ['安装中…', 'Installing…'],
       'act.useBundled': ['恢复内置', 'Use bundled'],
       'act.testModel': ['测试模型', 'Test model'],
       'f.paths.engine': ['引擎路径覆盖', 'Engine path override'],
@@ -785,8 +808,59 @@ window.__ModuleLoader__.load({
       'notify.advanced': ['高级：回退到自定义发送脚本', 'Advanced: fall back to a custom send script'],
       'msg.recheckDone': ['自检完成', 'Re-check finished'],
       'h.notifyHint': ['通知由引擎执行，不影响 DSH 里的运行结果', 'Notifications come from the engine; the run result is unaffected'],
-    'o.mlx': ['mlx_whisper（Apple Silicon）', 'mlx_whisper (Apple Silicon)'],
-    'o.faster': ['faster-whisper（CPU / GPU）', 'faster-whisper (CPU / GPU)'],
+      'act.fixDep': ['安装', 'Install'],
+      'onboard.title': ['从这里开始：五步出第一版字幕', 'Start here: five steps to your first subtitle'],
+      'onboard.desc': [
+        '第一次用没有配置文件，按顺序走完这五步就行。每一步做完会自动打勾，也可以直接点右边的按钮跳过去。',
+        'No config file yet. Walk these five steps in order \u2014 each one ticks itself off, and the button on the right jumps straight there.',
+      ],
+      'onboard.go': ['去设置', 'Open'],
+      'onboard.done': ['已完成', 'Done'],
+      'onboard.todo': ['待办', 'To do'],
+      'onboard.s1': ['装好依赖（ffmpeg 与转写引擎）', 'Install the dependencies (ffmpeg and a transcriber)'],
+      'onboard.s1h': [
+        '自检卡里带「安装」按钮的那几项点一下就行；ffmpeg 必须是带 ass/subtitles 滤镜的 ffmpeg-full。',
+        'Use the Install button on any check that has one. ffmpeg must be ffmpeg-full \u2014 the plain formula has no ass/subtitles filters.',
+      ],
+      'onboard.s2': ['选一个翻译模型', 'Pick a translation model'],
+      'onboard.s2h': [
+        '下拉里是 DSH 已经配置好的模型，外加本机 Ollama。列表为空说明 DSH 本身还没配模型，先去 DSH 里配。',
+        'The list holds the models DSH already knows plus local Ollama. An empty list means DSH itself has no model configured yet.',
+      ],
+      'onboard.s3': ['填来源目录和输出目录', 'Fill in the source and output folders'],
+      'onboard.s3h': [
+        'SSH 目录要手填路径（目录浏览器只能读本机）。输出目录可以等于来源目录。',
+        'SSH paths are typed by hand \u2014 the browser only reads this machine. Output may be the same folder as source.',
+      ],
+      'onboard.s4': ['先预演，再试跑一部', 'Dry-run first, then one real file'],
+      'onboard.s4h': [
+        '预演只算不跑，能看清每部片子为什么被选中或跳过。第一次真跑建议把「每次最多处理」设成 1。',
+        'A dry run only counts \u2014 it shows why each file was picked or skipped. For the first real run, keep max per run at 1.',
+      ],
+      'onboard.s5': ['设置定时（可选）', 'Schedule it (optional)'],
+      'onboard.s5h': [
+        'launchd 是系统级定时，到点就跑，不需要 DSH 开着。也可以先不设，手动跑。',
+        'launchd is a system-level schedule: it fires whether or not DSH is running. You can also skip it and run by hand.',
+      ],
+      'ov.fixDepConfirm': [
+        '要在这台机器上执行下面这条命令，装完会立刻重新自检。只在你本人点的时候执行，定时任务永远不会自动装。',
+        'This runs the command below on this machine, then re-runs the check. It only ever runs because you clicked it \u2014 a scheduled run never installs anything.',
+      ],
+      'ov.fixDepRunning': ['正在安装，可能要几分钟…', 'Installing \u2014 this can take a few minutes…'],
+      'ov.fixDepDone': ['安装命令已结束，已重新自检', 'Command finished; the check was re-run'],
+      'ov.fixDepFailed': ['安装失败：', 'Install failed: '],
+      'ov.fixDepCancelled': ['已取消，没有执行任何东西', 'Cancelled — nothing ran'],
+      'ov.fixDepRefreshed': ['依赖自检已重新跑过', 'Dependency check re-ran'],
+      'ov.fixDepAsk': ['确认执行这条命令？', 'Run this command?'],
+      'act.fixDepYes': ['确认安装', 'Install now'],
+      'act.fixDepNo': ['取消', 'Cancel'],
+      'o.verdict.failed': ['存在失败项', 'Failing'],
+      'ov.fixDepManual': [
+        '这一项没有一键安装（模型权重要下载几百 MB 到几 GB，留给你自己决定）。',
+        'No one-click install for this one: a model weight is a multi-GB download, left to you.',
+      ],
+    'o.transcribe.engine.mlx': ['mlx_whisper（Apple Silicon）', 'mlx_whisper (Apple Silicon)'],
+    'o.transcribe.engine.faster': ['faster-whisper（CPU / GPU）', 'faster-whisper (CPU / GPU)'],
     'f.transcribe.engine': ['转写引擎', 'Transcription engine'],
     'h.transcribe.engine': ['Apple Silicon 用 mlx_whisper；Intel 机器或已装 faster-whisper 的机器选 faster-whisper。',
       'Use mlx_whisper on Apple Silicon; pick faster-whisper on an Intel Mac or wherever faster-whisper is installed.'],
@@ -804,6 +878,7 @@ window.__ModuleLoader__.load({
       'o.superfast': ['superfast', 'superfast'],
       'o.veryfast': ['veryfast', 'veryfast'],
       'o.faster': ['faster', 'faster'],
+
       'o.fast': ['fast', 'fast'],
       'o.medium': ['medium', 'medium'],
       'o.slow': ['slow', 'slow'],
@@ -882,12 +957,13 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** POST JSON. */
-    function postJson(endpoint, value) {
+    /** POST JSON. `extra` may override init (e.g. a longer abort signal). */
+    function postJson(endpoint, value, extra) {
       return api(endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(value === undefined ? {} : value),
+        ...(extra || {}),
       })
     }
 
@@ -1225,6 +1301,10 @@ window.__ModuleLoader__.load({
       const [issues, setIssues] = React.useState([])
       const [banner, setBanner] = React.useState(null)
       const [busy, setBusy] = React.useState('')
+      // REQ-47(c)：最近一次一键安装的结果，只用来在那一行下面回一句实话
+      const [fixResult, setFixResult] = React.useState(null)
+      // 宿主屏蔽原生对话框时，安装动作要先在这里等一次卡片内的明确确认。
+      const [fixPending, setFixPending] = React.useState('')
       const [status, setStatus] = React.useState(null)
       const [doctor, setDoctor] = React.useState(null)
       const [engineStatus, setEngineStatus] = React.useState(null)
@@ -1244,6 +1324,8 @@ window.__ModuleLoader__.load({
       // 模型试跑：把「模型能不能用」当场验证掉，别等整条流水线跑失败才发现。
       const [modelTest, setModelTest] = React.useState(null)
       const [modelTesting, setModelTesting] = React.useState(false)
+      // { efforts: [{id,name,description}], defaultEffort, error, loading }
+      const [modelInfo, setModelInfo] = React.useState({ efforts: [], defaultEffort: '', error: '', loading: false })
       // 引擎 tab 只让人选一个模型：DSH 配置的模型与本机 Ollama 模型平级放在同一个下拉里。
       const [ollamaModels, setOllamaModels] = React.useState([])
       const [ollamaNote, setOllamaNote] = React.useState('')
@@ -1295,6 +1377,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         refreshOllama(data && data.config && data.config.engine ? data.config.engine.ollamaHost : '')
       }, [data, refreshOllama])
+
 
       // Status polling keeps the run card honest without any browser storage.
       React.useEffect(() => {
@@ -1572,6 +1655,54 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 一键补依赖（REQ-47c）：只有用户点这一下才会执行，定时任务里永远没有这条路。
+      // preAgreed=true 只由卡片内的二次确认按钮传入；没有它就必须先问到同意。
+      const fixDep = async (actionId, preAgreed) => {
+        if (busy !== '') return
+        const labels = (data.fixDeps && data.fixDeps.labels) || {}
+        const command = labels[actionId] || actionId
+        if (preAgreed !== true) {
+          if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+            // 只有明确的 true 才算同意：confirm 返回 undefined/null 时也当取消，
+            // 但要把「已取消」显示出来，不能点了没反应。
+            const agreed = window.confirm(`${i18n.t('ov.fixDepConfirm')}\n\n${command}`)
+            if (agreed !== true) {
+              setFixResult({ action: actionId, ok: false, cancelled: true, text: i18n.t('ov.fixDepCancelled') })
+              return
+            }
+          } else {
+            // 宿主屏蔽了原生对话框：不静默放行，改成卡片内的二次确认。
+            setFixPending(actionId)
+            return
+          }
+        }
+        setFixPending('')
+        setBusy(`fix:${actionId}`)
+        setFixResult({ action: actionId, ok: null, text: i18n.t('ov.fixDepRunning') })
+        // 一次 brew install 常态是几分钟。沿用默认的 30 秒，客户端会在服务端
+        // 还在装的时候报「安装失败」并解锁按钮 —— 于是假失败 + 诱发重复安装。
+        const longSignal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+          ? { signal: AbortSignal.timeout(20 * 60 * 1000) }
+          : {}
+        const response = await postJson('fix-dep', { action: actionId, confirm: true }, longSignal)
+        setBusy('')
+        const body = response.body || {}
+        const payload = body.data || {}
+        if (body.ok === true) {
+          setFixResult({ action: actionId, ok: true, text: `${i18n.t('ov.fixDepDone')} · ${payload.durationMs || 0}ms` })
+        } else {
+          const reason = payload.error || body.error || 'install failed'
+          setFixResult({ action: actionId, ok: false, text: i18n.t('ov.fixDepFailed') + String(reason).slice(0, 300) })
+        }
+        // 自检结果随响应回来了；用一次 describe 把卡片整体换成最新状态。
+        const fresh = await api('describe')
+        if (fresh.body && fresh.body.ok === true) {
+          setData(fresh.body.data)
+          if (draft === null) setDraft(clone(fresh.body.data.config))
+        }
+        setBanner({ tone: body.ok === true ? 'ok' : 'err', text: i18n.t('ov.fixDepRefreshed') })
+      }
+
       const applySchedule = async () => {
         if (draft === null) return
         setBusy('schedule')
@@ -1687,7 +1818,13 @@ window.__ModuleLoader__.load({
               value,
               options: field.options || [],
               onChange: (next) => setValue(field.path, next),
-              renderOption: (option) => (STRINGS[`o.${option}`] !== undefined ? i18n.t(`o.${option}`) : option),
+              renderOption: (option) => {
+                // 先找字段专属的标签（o.<path>.<值>），再退回全局 o.<值>：
+                // ffmpeg 预置里有 'faster'，转写引擎也有 'faster'，共用一个键必然打架。
+                const scoped = `o.${field.path}.${option}`
+                if (STRINGS[scoped] !== undefined) return i18n.t(scoped)
+                return STRINGS[`o.${option}`] !== undefined ? i18n.t(`o.${option}`) : option
+              },
             })
             break
           case 'int':
@@ -1810,9 +1947,63 @@ window.__ModuleLoader__.load({
         return h(Chip, { tone: lastRun.exitCode === 0 ? 'ok' : 'err' }, `exit ${lastRun.exitCode === null ? '—' : lastRun.exitCode}`)
       }
 
+      // REQ-48：新用户第一次打开时只看到「配置文件还不存在」一句话，不知道该
+      // 先做什么。这里按实际状态算一遍清单，每步带一个「跳过去」的按钮。
+      const onboardingCard = (() => {
+        if (data.exists !== false) return null
+        const sc = data.selfcheck
+        const checks = sc && Array.isArray(sc.checks) ? sc.checks : []
+        const depOk = sc !== null && sc !== undefined &&
+          !checks.some((check) => check.level === 'error')
+        const engine = data.config && data.config.engine ? data.config.engine : {}
+        const modelOk = String(engine.model || '').trim() !== '' &&
+          (engine.kind !== 'dsh' || String(engine.provider || '').trim() !== '')
+        const pathsOk = String((data.config && data.config.source && data.config.source.path) || '').trim() !== '' &&
+          String((data.config && data.config.output && data.config.output.path) || '').trim() !== ''
+        const ranOnce = Boolean(data.run && data.run.last && data.run.last.runId)
+        const schedule = (data.config && data.config.schedule) || {}
+        const scheduleOk = schedule.enabled === true && schedule.mode !== 'off'
+        const steps = [
+          ['onboard.s1', 'onboard.s1h', depOk, 'overview'],
+          ['onboard.s2', 'onboard.s2h', modelOk, 'engine'],
+          ['onboard.s3', 'onboard.s3h', pathsOk, 'paths'],
+          ['onboard.s4', 'onboard.s4h', ranOnce, 'overview'],
+          ['onboard.s5', 'onboard.s5h', scheduleOk, 'schedule'],
+        ]
+        const doneCount = steps.filter((step) => step[2]).length
+        return h(
+          Card,
+          {
+            title: `${i18n.t('onboard.title')}（${doneCount}/${steps.length}）`,
+            desc: i18n.t('onboard.desc'),
+          },
+          h(
+            'ol',
+            { style: { margin: '4px 0 0', paddingLeft: 20, color: T.secondary, lineHeight: 1.8 } },
+            steps.map(([titleKey, hintKey, done, target], index) =>
+              h(
+                'li',
+                { key: titleKey, style: { color: done ? T.success : T.label } },
+                h('span', { style: { fontWeight: 600 } }, i18n.t(titleKey)),
+                h(Chip, { tone: done ? 'ok' : 'idle' }, i18n.t(done ? 'onboard.done' : 'onboard.todo')),
+                done || target === 'overview'
+                  ? null
+                  : h(
+                      'span',
+                      { style: { marginLeft: 8 } },
+                      h(Btn, { onClick: () => switchTab(target) }, `${i18n.t('onboard.go')} · ${i18n.t(`tab.${target}`)}`),
+                    ),
+                h('div', { style: { ...S.hint, fontWeight: 400 } }, i18n.t(hintKey)),
+              ),
+            ),
+          ),
+        )
+      })()
+
       const overviewTab = h(
         React.Fragment,
         null,
+        onboardingCard,
         h(
           Card,
           { title: i18n.t('ov.status'), actions: statusChip() },
@@ -1879,11 +2070,46 @@ window.__ModuleLoader__.load({
                         { style: { margin: '2px 0 0', paddingLeft: 18, color: T.secondary, lineHeight: 1.6 } },
                         bad.map((check) => {
                           const hint = check.detail && check.detail.hint ? `（${check.detail.hint}）` : ''
+                          // REQ-47(c)：能一键补的那几项后面挂一个安装按钮；
+                          // 命令文本只用于文案，动作 id 才是面板能传的全部。
+                          const byCheck = (data.fixDeps && data.fixDeps.byCheck) || {}
+                          const actionId = byCheck[check.name]
+                          const labels = (data.fixDeps && data.fixDeps.labels) || {}
+                          const fixable = typeof actionId === 'string' && labels[actionId] !== undefined
+                          const working = busy === `fix:${actionId}`
+                          const outcome = fixResult && fixResult.action === actionId ? fixResult : null
                           return h(
                             'li',
                             { key: `${check.group || ''}:${check.name}`, style: { color: check.level === 'error' ? T.error : T.warn } },
                             h('code', { style: S.code }, check.name || '—'),
                             ` ${check.message || ''}${hint}`,
+                            fixable
+                              ? h(
+                                  'span',
+                                  { style: { display: 'inline-flex', gap: 6, alignItems: 'center', marginLeft: 8, flexWrap: 'wrap' } },
+                                  fixPending === actionId
+                                    ? h(React.Fragment, null,
+                                      h('span', { style: S.hint }, `${i18n.t('ov.fixDepAsk')} `),
+                                      h('code', { style: S.code }, labels[actionId]),
+                                      h(Btn, { primary: true, onClick: () => fixDep(actionId, true), disabled: busy !== '' }, i18n.t('act.fixDepYes')),
+                                      h(Btn, { onClick: () => setFixPending(''), disabled: busy !== '' }, i18n.t('act.fixDepNo')),
+                                    )
+                                    : h(
+                                      Btn,
+                                      { onClick: () => fixDep(actionId), disabled: busy !== '' },
+                                      working ? i18n.t('act.fixing') : `${i18n.t('act.fixDep')} · ${labels[actionId]}`,
+                                    ),
+                                  outcome !== null
+                                    ? h(
+                                        Chip,
+                                        { tone: outcome.ok === true ? 'ok' : outcome.cancelled === true ? 'warn' : outcome.ok === false ? 'err' : 'warn' },
+                                        String(outcome.text).slice(0, 160),
+                                      )
+                                    : null,
+                                )
+                              : check.name === 'whisper.model'
+                                ? h('span', { style: { ...S.hint, marginLeft: 8 } }, i18n.t('ov.fixDepManual'))
+                                : null,
                           )
                         }),
                       ),
@@ -1984,6 +2210,19 @@ window.__ModuleLoader__.load({
       const engineKind = String(getAt(draft, 'engine.kind') ?? '')
       const providerValue = String(getAt(draft, 'engine.provider') ?? '')
       const modelValue = String(getAt(draft, 'engine.model') ?? '')
+      // 档位清单是模型自己的，选完模型才知道；手填也是合法路径（有些模型
+      // 不在本地 catalog 里，宿主问不出清单）。
+      const REASONING_FREE = '__free__'
+      const reasoningEffortValue = String(getAt(draft, 'engine.reasoningEffort') ?? '')
+      const reasoningValue = modelInfo.efforts.some((effort) => String(effort.id) === reasoningEffortValue)
+        ? reasoningEffortValue
+        : reasoningEffortValue === ''
+          ? ''
+          : REASONING_FREE
+      // 选了一个模型不认的档位：先说出来，别等跑起来才发现每一批都白花钱。
+      const effortMismatch = modelInfo.efforts.length > 0
+        && reasoningEffortValue !== ''
+        && !modelInfo.efforts.some((effort) => String(effort.id) === reasoningEffortValue)
       const ollamaHostValue = String(getAt(draft, 'engine.ollamaHost') ?? '')
       const legacyEngine = !['dsh', 'ollama'].includes(engineKind)
       const engineFieldByPath = (path) =>
@@ -2036,6 +2275,7 @@ window.__ModuleLoader__.load({
           provider: providerValue,
           model: modelValue,
           host: ollamaHostValue,
+          reasoningEffort: reasoningEffortValue,
         })
         setModelTesting(false)
         if (response.status === 0) {
@@ -2052,6 +2292,39 @@ window.__ModuleLoader__.load({
           message: `${i18n.t('msg.modelTestFail')}：${String((response.body && (response.body.error || response.body.message)) || `HTTP ${response.status}`)}`,
         })
       }
+
+      /** 问宿主要这个模型声明的思考档位；问不到就诚实说明，不猜。 */
+      const refreshModelInfo = React.useCallback(async (provider, model) => {
+        if (provider === '' || model === '') {
+          setModelInfo({ efforts: [], defaultEffort: '', error: '', loading: false })
+          return
+        }
+        setModelInfo((previous) => ({ ...previous, loading: true, error: '' }))
+        const response = await api(
+          `model-info?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`,
+        )
+        const payload = response.body && response.body.ok === true ? response.body.data : null
+        if (payload === null || payload === undefined) {
+          setModelInfo({
+            efforts: [],
+            defaultEffort: '',
+            error: (response.body && (response.body.error || response.body.message)) || `HTTP ${response.status}`,
+            loading: false,
+          })
+          return
+        }
+        const efforts = Array.isArray(payload.efforts) ? payload.efforts : []
+        setModelInfo({
+          efforts,
+          defaultEffort: String(payload.defaultEffort ?? ''),
+          error: String(payload.error ?? '') || (efforts.length === 0 ? i18n.t('ov.reasoningUndeclared') : ''),
+          loading: false,
+        })
+      }, [])
+
+      React.useEffect(() => {
+        refreshModelInfo(providerValue, modelValue)
+      }, [refreshModelInfo, providerValue, modelValue])
 
       const testReady = modelValue !== '' && (engineKind !== 'dsh' || providerValue !== '')
 
@@ -2177,6 +2450,52 @@ window.__ModuleLoader__.load({
                 ),
                 modelTest === null ? null : h(Chip, { tone: modelTest.ok === true ? 'ok' : 'err' }, modelTest.message),
               ),
+              engineKind === 'dsh'
+                ? h(
+                    'div',
+                    { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+                    h('span', { style: { ...S.label, flexShrink: 0 } }, i18n.t('f.engine.reasoningEffort')),
+                    h(
+                      'select',
+                      {
+                        style: { ...S.control, appearance: 'auto', maxWidth: 240 },
+                        value: reasoningValue,
+                        spellCheck: false,
+                        onChange: (event) => {
+                          setValue('engine.reasoningEffort', event.target.value === REASONING_FREE ? reasoningValue : event.target.value)
+                          setModelTest(null)
+                        },
+                      },
+                      h('option', { value: '' }, i18n.t('o.reasoningDefault')),
+                      modelInfo.efforts.map((effort) =>
+                        h(
+                          'option',
+                          { key: String(effort.id), value: String(effort.id) },
+                          `${String(effort.id)}${modelInfo.defaultEffort === effort.id ? ' (default)' : ''} — ${String(effort.name ?? effort.id)}`,
+                        ),
+                      ),
+                      h('option', { value: REASONING_FREE }, i18n.t('o.reasoningOther')),
+                    ),
+                    reasoningValue === REASONING_FREE
+                      ? h(TextInput, {
+                          value: String(getAt(draft, 'engine.reasoningEffort') ?? ''),
+                          placeholder: 'low',
+                          onChange: (next) => {
+                            setValue('engine.reasoningEffort', next)
+                            setModelTest(null)
+                          },
+                        })
+                      : null,
+                    modelInfo.loading === true
+                      ? h('span', { style: S.hint }, i18n.t('ov.modelInfoLoading'))
+                      : modelInfo.error
+                        ? h(Chip, { tone: 'warn' }, modelInfo.error)
+                        : null,
+                    effortMismatch
+                      ? h(Chip, { tone: 'warn' }, i18n.t('ov.reasoningMismatch').replace('{effort}', reasoningEffortValue))
+                      : null,
+                  )
+                : null,
             ),
           ),
           ...['engine.temperature', 'engine.seed', 'engine.maxTokens', 'engine.batchSize']
@@ -2959,7 +3278,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { style: S.grid },
-            ['notify.channel', 'notify.onStart', 'notify.onSuccess', 'notify.onFailure']
+            ['notify.channel', 'notify.successWhen', 'notify.onStart', 'notify.onSuccess', 'notify.onFailure']
               .map((path) => fields.find((entry) => entry.path === path))
               .filter((field) => field !== undefined && fieldVisible(field))
               .map((field) => h(React.Fragment, { key: field.path }, renderControl(field))),

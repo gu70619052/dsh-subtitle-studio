@@ -21,6 +21,8 @@ ENGINE_KINDS = ("dsh", "minimax", "ollama", "deepseek", "openai-compatible")
 SOURCE_KINDS = ("local", "ssh")
 ORDERS = ("name-asc", "name-desc", "mtime-asc", "mtime-desc", "size-asc", "size-desc")
 NOTIFY_CHANNELS = ("qqbot", "command", "webhook", "none")
+# 「什么算成功」的两种口径：整轮零失败 / 至少产出一部。
+NOTIFY_SUCCESS_WHEN = ("run", "anyOutput")
 OUTPUT_MODES = ("burn", "srt")
 STYLE_TEMPLATE_IDS = tuple(_style_ids())
 SSH_DEFAULT_PORTS = {"default": 22}
@@ -35,6 +37,7 @@ DEFAULTS = {
         "seed": 42,
         "maxTokens": 8000,
         "batchSize": 30,
+        "reasoningEffort": "",
         "ollamaHost": "http://127.0.0.1:11434",
         "baseUrl": "",
         "apiKeyRef": "",
@@ -70,6 +73,9 @@ DEFAULTS = {
         "maxAgeDays": 36500,
         "order": "mtime-asc",
         "excludePatterns": ["*.partial", "*.tmp", "*.part"],
+        # 输出目录与来源目录相同时，按命名模板认出自家的成品并排掉，
+        # 避免 X_zh.mp4 被再翻成 X_zh_zh.mp4（REQ-60）。
+        "skipOwnOutputs": True,
     },
     "prompts": {
         "default": {"system": "", "context": ""},
@@ -130,6 +136,9 @@ DEFAULTS = {
         "onStart": False,
         "onSuccess": True,
         "onFailure": True,
+        # 什么算「成功」：run = 整轮零失败（旧语义，默认）；
+        # anyOutput = 至少有产出一部（部分成功也算成功，另有失败通知）。
+        "successWhen": "run",
     },
     "schedule": {
         "enabled": True,
@@ -301,6 +310,21 @@ def _check_ssh(issues, prefix, ssh, required):
         issues.append({"path": prefix + ".options", "level": "error", "message": "ssh.options 必须是数组"})
 
 
+def _template_renders(template):
+    """命名模板只支持 {stem} / {name} / {ext} 三个键（见 select.output_name）。
+
+    写成 `{stem[:10]}` 或 `{stem.lower()}` 时 str.format 抛的是 TypeError /
+    AttributeError，而 output_name 只吞 KeyError/IndexError/ValueError ——
+    选片阶段每扫一个文件炸一次，整轮直接挂（R3）。所以校验时先试渲染一次，
+    把错误提前到配置页，而不是留到夜里。
+    """
+    try:
+        template.format(stem="sample", name="sample.mkv", ext="mp4")
+    except Exception:  # noqa: BLE001 - 坏格式串的异常形态很多
+        return False
+    return True
+
+
 def _check_dir_pair(issues, prefix, source, output):
     """校验一个目录项（来源 + 输出）。"""
     def err(path, message):
@@ -330,6 +354,9 @@ def _check_dir_pair(issues, prefix, source, output):
     template = output.get("nameTemplate") or ""
     if "{stem}" not in template:
         err(prefix + ".output.nameTemplate", "必须包含 {stem} 占位符，当前 %r" % (template,))
+    elif not _template_renders(template):
+        err(prefix + ".output.nameTemplate",
+            "模板渲染不了，只支持 {stem} / {name} / {ext} 三个占位符，当前 %r" % (template,))
     if not isinstance(output.get("overwrite"), bool):
         err(prefix + ".output.overwrite", "必须是 true/false")
     _check_ssh(issues, prefix + ".output.ssh", output.get("ssh") or {}, output.get("kind") == "ssh")
@@ -403,6 +430,9 @@ def validate(data):
         err("engine.maxTokens", "必须是正整数")
     if not _is_int(engine.get("batchSize")) or not (1 <= engine["batchSize"] <= 500):
         err("engine.batchSize", "必须是 1-500 的整数")
+    effort = str(engine.get("reasoningEffort") or "").strip()
+    if effort and not re.match(r"^[A-Za-z0-9._-]{1,40}$", effort):
+        err("engine.reasoningEffort", "只能是字母/数字/. _ - 组成的档位名，或留空跟随模型默认")
     if engine.get("kind") == "dsh":
         if not (engine.get("provider") or "").strip():
             err("engine.provider", "dsh 引擎必须配置 provider（DSH 侧的模型提供方）")
@@ -476,6 +506,9 @@ def validate(data):
     template = output.get("nameTemplate") or ""
     if "{stem}" not in template:
         err("output.nameTemplate", "必须包含 {stem} 占位符，当前 %r" % (template,))
+    elif not _template_renders(template):
+        err("output.nameTemplate",
+            "模板渲染不了，只支持 {stem} / {name} / {ext} 三个占位符，当前 %r" % (template,))
     if not isinstance(output.get("overwrite"), bool):
         err("output.overwrite", "必须是 true/false")
     _check_ssh(issues, "output.ssh", output.get("ssh") or {}, output.get("kind") == "ssh")
@@ -486,6 +519,8 @@ def validate(data):
         err("selection.maxPerRun", "必须是 >=0 的整数（0 表示不限额）")
     if not isinstance(sel.get("skipTranslated"), bool):
         err("selection.skipTranslated", "必须是 true/false")
+    if not isinstance(sel.get("skipOwnOutputs"), bool):
+        err("selection.skipOwnOutputs", "必须是 true/false")
     for key in ("minSizeGB", "maxSizeGB"):
         if not _is_num(sel.get(key)) or sel[key] < 0:
             err("selection." + key, "必须是 >=0 的数字")
@@ -595,6 +630,8 @@ def validate(data):
     for key in ("enabled", "onStart", "onSuccess", "onFailure"):
         if not isinstance(notify.get(key), bool):
             err("notify." + key, "必须是 true/false")
+    if notify.get("successWhen") not in NOTIFY_SUCCESS_WHEN:
+        err("notify.successWhen", "必须是 %s 之一" % (list(NOTIFY_SUCCESS_WHEN),))
     if notify.get("channel") == "qqbot":
         app_id = (notify.get("qqAppId") or "").strip()
         open_id = (notify.get("qqOpenId") or "").strip()

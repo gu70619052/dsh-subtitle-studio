@@ -118,7 +118,19 @@ GEN_OPTS = {
     "max_tokens": int(os.environ.get("SUBTITLE_MAX_TOKENS") or 8000),
     "batch_size": int(os.environ.get("SUBTITLE_BATCH_SIZE") or 30),
     "ollama_host": os.environ.get("SUBTITLE_OLLAMA_HOST") or "http://127.0.0.1:11434",
+    # 思考档位：留空 = 不告诉模型任何档位，跟随它在 DSH 里的默认。
+    # 合法取值是每个模型自己的元数据，面板从宿主问出来再给你选。
+    "reasoning_effort": os.environ.get("SUBTITLE_REASONING_EFFORT") or "",
 }
+
+# 一批被截断时拆多重问：深度与总次数都封了顶，避免坏模型把一轮跑成无底洞。
+SPLIT_MAX_DEPTH = 3
+SPLIT_MAX_CALLS = 24
+SPLIT_MIN_SIZE = 2
+# 每轮运行的自救统计，最后写进 .report.json 供上层与通知使用。
+RUN_STATS = {"primary": 0, "split": 0, "truncated": 0, "failed": 0,
+             "tokens": {"input": 0, "output": 0, "reasoning": 0},
+             "untranslated": []}
 
 def format_time(sec):
     if sec < 0: sec = 0
@@ -242,32 +254,55 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
         "temperature": GEN_OPTS["temperature"],
         "maxTokens": GEN_OPTS["max_tokens"],
     }
+    if GEN_OPTS.get("reasoning_effort"):
+        payload["reasoningEffort"] = GEN_OPTS["reasoning_effort"]
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "X-Subtitle-Studio-Token": token,
     }
-    # 4xx 里的这些是"再问一遍也一样的"：重试只是三倍计费
+    # 这些是"再问一遍也一样的"：重试只是三倍计费。截断也在其中——同一批、
+    # 同一预算再问一次只会切在同一处，宿主会把已经写出来的部分原样回传，
+    # 由上层拆小批重问缺的那一段。
     fatal_codes = {"unauthorized", "forbidden", "not-found", "bad-body",
                    "bad-content-type", "payload-too-large", "invalid-request",
-                   "unknown-provider", "unknown-model"}
+                   "unknown-provider", "unknown-model", "bad-request",
+                   "token-limit", "unknown-effort"}
     for attempt in range(3):
         try:
             request = urllib.request.Request(url, data=data, headers=headers)
             with urllib.request.urlopen(request, timeout=300) as response:
                 body = json.loads(response.read().decode("utf-8", "replace"))
             if body.get("ok"):
-                text = str((body.get("data") or {}).get("text") or "")
+                data_block = body.get("data") or {}
+                usage = data_block.get("usage") or {}
+                meta = {
+                    "total_tokens": int(usage.get("outputTokens") or 0),
+                    "input_tokens": int(usage.get("inputTokens") or 0),
+                    "reasoning_tokens": int(usage.get("reasoningTokens") or 0),
+                    "truncated": body.get("truncated") is True,
+                    "fatal": False,
+                    "code": "",
+                }
+                text = str(data_block.get("text") or "")
+                if meta["truncated"]:
+                    # 截断不是失败：能对上时间戳的块照样收下，缺的交给拆批重问。
+                    print("    ⚠️ 模型在 token 上限处被切断%s，只保留写出来的部分" % (
+                        "（思考 %d token）" % meta["reasoning_tokens"] if meta["reasoning_tokens"] else ""),
+                        flush=True)
                 if text.strip():
-                    return text.strip(), {"total_tokens": 0}
+                    return text.strip(), meta
                 print("    ⚠️ DSH 返回空内容", flush=True)
-            else:
-                code = str(body.get("code") or "")
-                message = str(body.get("error"))[:200]
-                print("    ⚠️ DSH 调用失败: %s" % message, flush=True)
-                if code in fatal_codes or "is required" in message or "unknown" in code:
-                    print("    ↳ 配置类错误，不再重试", flush=True)
-                    return None, {}
+                meta["fatal"] = True
+                meta["code"] = "empty-answer"
+                return None, meta
+            code = str(body.get("code") or "")
+            message = str(body.get("error"))[:200]
+            print("    ⚠️ DSH 调用失败: %s" % message, flush=True)
+            if code in fatal_codes or "is required" in message or "unknown" in code:
+                print("    ↳ 配置类错误，不再重试", flush=True)
+                return None, {"fatal": True, "code": code or "config-error",
+                              "total_tokens": 0, "reasoning_tokens": 0}
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
@@ -275,17 +310,30 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
             except Exception:  # noqa: BLE001
                 pass
             print("    ⚠️ DSH 中转返回 %d: %s" % (exc.code, detail), flush=True)
+            # 宿主在错误体里给了自己的 code（rate-limited / unknown-effort …），
+            # 读出来才能分清「等一会儿再来」和「改了也不会好」。
+            relay_code = ""
+            try:
+                relay_code = str((json.loads(detail) or {}).get("code") or "")
+            except Exception:  # noqa: BLE001
+                relay_code = ""
+            if relay_code and relay_code in fatal_codes:
+                print("    ↳ 配置类错误，不再重试", flush=True)
+                return None, {"fatal": True, "code": relay_code,
+                              "total_tokens": 0, "reasoning_tokens": 0}
             if exc.code == 429:
                 time.sleep(20 + attempt * 20)
                 continue
             if 400 <= exc.code < 500:
                 print("    ↳ 请求本身被拒绝，不再重试", flush=True)
-                return None, {}
+                return None, {"fatal": True, "code": relay_code or ("rejected-%d" % exc.code),
+                              "total_tokens": 0, "reasoning_tokens": 0}
         except Exception as exc:  # noqa: BLE001
             print("    ⚠️ DSH 调用异常(%d/3): %s" % (attempt + 1, exc), flush=True)
         if attempt < 2:
             time.sleep(2 + attempt * 2)
-    return None, {}
+    return None, {"fatal": False, "code": "unreachable",
+                  "total_tokens": 0, "reasoning_tokens": 0}
 
 
 def _call_ollama(system, user_prompt, model):
@@ -460,6 +508,79 @@ def _retrain_with_engine(blocks, model, bilingual, video_context):
     return records
 
 
+def _match_translated(batch, srt_text):
+    """按时间戳反查模型输出，返回 {原块序号: 译文}。
+
+    不按位置对应：模型会自己洗牌、也会少写几条，位置对齐会把译文安到错误的
+    时间轴上。反查不到的块宁可先留原文，交给拆批重问。
+    """
+    translated = parse_srt(srt_text)
+    by_start = {}
+    for block in translated:
+        by_start.setdefault(block["start"], block)
+    got = {}
+    for src in batch:
+        hit = by_start.get(src["start"])
+        if hit is not None:
+            got[src["idx"]] = _strip_bilingual(hit["text"])
+    return got
+
+
+def _add_usage(meta):
+    if not isinstance(meta, dict):
+        return
+    RUN_STATS["tokens"]["input"] += int(meta.get("input_tokens") or 0)
+    RUN_STATS["tokens"]["output"] += int(meta.get("total_tokens") or 0)
+    RUN_STATS["tokens"]["reasoning"] += int(meta.get("reasoning_tokens") or 0)
+
+
+def translate_batch_resilient(batch, key, model, bilingual, video_context,
+                              engine="minimax", provider="", depth=0):
+    """一批翻译，但「整批失败」不再等于「整批保留原文」。
+
+    拿到多少算多少；缺的部分拆小批重问（深度与总次数封顶），实在拿不到才留
+    原文，并记下是第几条、为什么。截断的批次走同一条路：宿主会把截断前的正文
+    发回来，能对上时间戳的块直接收下。
+    """
+    result, meta = translate_batch(batch, key, model, bilingual, video_context,
+                                   engine=engine, provider=provider)
+    if depth == 0:
+        RUN_STATS["primary"] += 1
+    _add_usage(meta)
+    if meta.get("truncated"):
+        RUN_STATS["truncated"] += 1
+    got = _match_translated(batch, result) if result else {}
+    missing = [b for b in batch if b["idx"] not in got]
+    fatal = bool(meta.get("fatal"))
+    if missing and not fatal and len(missing) >= SPLIT_MIN_SIZE and depth < SPLIT_MAX_DEPTH:
+        if RUN_STATS["split"] < SPLIT_MAX_CALLS:
+            half = (len(missing) + 1) // 2
+            RUN_STATS["split"] += 1
+            print("    ↳ 缺 %d/%d 条，拆成 %d+%d 重问（第 %d 层）" % (
+                len(missing), len(batch), half, len(missing) - half, depth + 1), flush=True)
+            for part in (missing[:half], missing[half:]):
+                if part:
+                    got.update(translate_batch_resilient(
+                        part, key, model, bilingual, video_context,
+                        engine=engine, provider=provider, depth=depth + 1))
+    elif missing and not fatal and len(missing) == 1 and depth < SPLIT_MAX_DEPTH:
+        if RUN_STATS["split"] < SPLIT_MAX_CALLS:
+            RUN_STATS["split"] += 1
+            got.update(translate_batch_resilient(
+                missing, key, model, bilingual, video_context,
+                engine=engine, provider=provider, depth=depth + 1))
+    if fatal and missing:
+        RUN_STATS["failed"] += 1
+    for src in batch:
+        if src["idx"] not in got:
+            RUN_STATS["untranslated"].append({
+                "idx": src["idx"], "start": src["start"],
+                "reason": meta.get("code") or ("truncated" if meta.get("truncated") else "missing"),
+            })
+            got[src["idx"]] = src["text"]
+    return got
+
+
 def _build_user_prompt(batch, video_context):
     """拼装 user prompt (从 main 抽出来便于复用)"""
     srt_text = "\n\n".join(
@@ -487,6 +608,9 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SUBTITLE_MAX_TOKENS") or 8000),
                         dest="max_tokens")
     parser.add_argument("--ollama-host", default=os.environ.get("SUBTITLE_OLLAMA_HOST") or "http://127.0.0.1:11434")
+    parser.add_argument("--reasoning-effort", dest="reasoning_effort",
+                        default=os.environ.get("SUBTITLE_REASONING_EFFORT") or "",
+                        help="思考档位（留空跟随模型默认；档位清单由 DSH 提供）")
     parser.add_argument("--system-file", dest="system_file", default=None,
                        help="用文件内容覆盖内置 system 提示词（config.prompts）")
     parser.add_argument("--engine", choices=["dsh", "minimax", "deepseek", "ollama", "openai-compatible"],
@@ -513,6 +637,7 @@ def main():
         "max_tokens": args.max_tokens,
         "batch_size": args.batch_size,
         "ollama_host": args.ollama_host,
+        "reasoning_effort": (args.reasoning_effort or "").strip(),
     })
     bilingual = args.bilingual
     video_context = args.video_context
@@ -614,45 +739,16 @@ def main():
         first_idx, last_idx = batch[0]['idx'], batch[-1]['idx']
         print(f"  [{i+1}/{len(batches)}] blocks {first_idx}-{last_idx} ...", end=" ", flush=True)
         
-        result, usage = translate_batch(batch, key, model, bilingual, video_context,
+        u_before = len(RUN_STATS['untranslated'])
+        tok_before = RUN_STATS['tokens']['output']
+        got = translate_batch_resilient(batch, key, model, bilingual, video_context,
                                         engine=engine, provider=provider)
         dt = time.time() - t0
-        
-        if result is None:
-            print(f"FAILED in {dt:.1f}s, 保留原文", flush=True)
-            for b in batch:
-                translated_records.append((b['idx'], b['start'], b['end'], b['text']))
-        else:
-            total_tokens += usage.get('total_tokens', 0)
-            print(f"OK in {dt:.1f}s", flush=True)
-            
-            translated_blocks = parse_srt(result)
-            if not translated_blocks:
-                print(f"    parse fail, 保留原文", flush=True)
-                for b in batch:
-                    translated_records.append((b['idx'], b['start'], b['end'], b['text']))
-            else:
-                # v2.12 修复: 不用 j 索引(LLM 内部洗牌导致错位)
-                # 改用 LLM 输出的时间戳反查 src block, 找不到的保留原文
-                n_t, n_o = len(translated_blocks), len(batch)
-                # 1) 用时间戳反查, LLM 输出有 start 字段且与 batch 某条 start 一致
-                tb_by_start = {tb['start']: tb for tb in translated_blocks}
-                matched = 0
-                for o_block in batch:
-                    if o_block['start'] in tb_by_start:
-                        tb = tb_by_start[o_block['start']]
-                        # v2.12: 双语清洗(单语模式下, 错误输出的双语只取中文行)
-                        zh_text = _strip_bilingual(tb['text'])
-                        translated_records.append((o_block['idx'], o_block['start'], o_block['end'], zh_text))
-                        matched += 1
-                    else:
-                        # LLM 未输出这一条 → 保留原文(保留 src 时间轴, 不动)
-                        translated_records.append((o_block['idx'], o_block['start'], o_block['end'], o_block['text']))
-                if matched < n_o:
-                    miss = n_o - matched
-                    print(f"    ⚠️ LLM 漏 {miss}/{n_o} 条, 已保留原文", flush=True)
-                if n_t != n_o:
-                    print(f"    ⚠️ n_t={n_t} != n_o={n_o}, 用时间戳反查代替位置对应", flush=True)
+        total_tokens += RUN_STATS['tokens']['output'] - tok_before
+        miss = len(RUN_STATS['untranslated']) - u_before
+        print(f"OK in {dt:.1f}s" + (f", 仍未译 {miss}/{len(batch)}" if miss else ""), flush=True)
+        for b in batch:
+            translated_records.append((b['idx'], b['start'], b['end'], got[b['idx']]))
 
         # 写进度 + tmp
         with open(progress_file, "w") as f:
@@ -703,6 +799,27 @@ def main():
         except Exception as e:
             print(f"  ⚠️ ollama fallback 失败: {e}, 保留 minimax 结果", flush=True)
     
+    # 自救报告：把「哪几条没译、为什么、拆了几次批、思考吃了多少 token」留在
+    # 产物旁边。上层与通知平时只看数字，出问题时这几行就是唯一的线索来源。
+    try:
+        with open(out_path + ".report.json", "w", encoding="utf-8") as handle:
+            json.dump({
+                "blocks": total,
+                "untranslated": untranslated,
+                "untranslatedIds": RUN_STATS["untranslated"][:80],
+                "calls": {"primary": RUN_STATS["primary"], "split": RUN_STATS["split"]},
+                "truncatedBatches": RUN_STATS["truncated"],
+                "failedBatches": RUN_STATS["failed"],
+                "tokens": RUN_STATS["tokens"],
+                "reasoningEffort": GEN_OPTS.get("reasoning_effort") or "",
+            }, handle, ensure_ascii=False, indent=1)
+    except OSError as exc:
+        print(f"  ⚠️ 自救报告写不出: {exc}", flush=True)
+    if RUN_STATS["split"] or RUN_STATS["truncated"] or RUN_STATS["untranslated"]:
+        print("  🧪 自救: 拆批重问 %d 次 / 截断 %d 批 / 仍未译 %d 条" % (
+            RUN_STATS["split"], RUN_STATS["truncated"],
+            len(RUN_STATS["untranslated"])), flush=True)
+
     # 收尾
     shutil.move(out_tmp, out_path)
     os.remove(progress_file)

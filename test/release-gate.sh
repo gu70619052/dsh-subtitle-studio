@@ -179,6 +179,16 @@ if "$PYTHON" test/v14_test.py >/tmp/gate-v14.log 2>&1; then
 else
   bad "v1.4 feature suite failed"; tail -20 /tmp/gate-v14.log
 fi
+if "$PYTHON" test/v15_test.py >/tmp/gate-v15.log 2>&1; then
+  pass "v1.5 feature suite ($(grep -c '^PASS' /tmp/gate-v15.log) checks)"
+else
+  bad "v1.5 feature suite failed"; tail -20 /tmp/gate-v15.log
+fi
+if "$PYTHON" test/v16_test.py >/tmp/gate-v16.log 2>&1; then
+  pass "v1.6 feature suite ($(grep -c '^PASS' /tmp/gate-v16.log) checks)"
+else
+  bad "v1.6 feature suite failed"; tail -20 /tmp/gate-v16.log
+fi
 if node test/ui-smoke.mjs >/tmp/gate-ui.log 2>&1; then
   pass "ui smoke suite ($(grep -c '^PASS' /tmp/gate-ui.log) checks)"
 else

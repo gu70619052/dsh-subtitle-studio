@@ -66,6 +66,53 @@ enough.
   single-directory behaviour.
 - Two rows writing into the same output folder is allowed but warned about: same-named files overwrite each other.
 
+## Already translated: the ledger and own output
+
+The plan has two independent things to say about a file that has been dealt with
+before, and both are visible in the `reason` column.
+
+**`translated-ledger`** — `state/translated.json` holds, per produced file,
+`{key, output, mode, at, sourceDir}` where `key` is the source name, prefixed with the
+directory tag when several folders are watched (the same tag `state/skipped.json` uses,
+so a record keeps working when the folder order changes). The ledger is consulted before
+the folder check, which is why moving the output folder or switching `output.mode` no
+longer re-translates anything.
+
+A record is verified, not trusted: `verify_ledger_hits()` groups the hits by the folder
+their product lives in, lists each folder once (at most eight; beyond that the rest are
+not looked at) and returns `(verified, unchecked)`. Only a folder we actually looked
+into can veto a record: a hit whose product is gone is dropped and the file translates
+again, because a wasted round is cheaper than silently skipping a film the user deleted
+and re-ripped. A folder we *could not* look into — unreachable endpoint, a listing that
+raised, or a nineeenth folder over the scan limit — keeps its hits and is counted in
+`unchecked`: an offline NAS for one night must not cost the whole library a re-translation
+(it also means the record is a claim, not a guarantee; delete the entry from
+`state/translated.json` when a product really did vanish). The plan reports
+`dirs[].ledger = {hits, missing, unchecked}` so this is visible before a run, and a warn
+line says how many records went unverified. `translated-exists` (the expected name is
+present) stays as a second, independent signal and both reasons carry
+`translatedEvidence`: the absolute path that was actually checked.
+
+The list is capped at `TRANSLATED_MAX = 5000` entries, oldest `at` evicted first; the
+file is written atomically with mode `0600`, and a file that cannot be parsed degrades to
+an empty ledger rather than failing the round.
+
+**`own-output`** — with source and output on the same folder, `X_zh.mp4` would be picked
+up and written as `X_zh_zh.mp4`, which the overwrite policy cannot catch. A file is
+called own output when either (a) it equals the expected product name of another file in
+the same batch, or (b) it matches the reverse of `nameTemplate` and sits in the output
+folder. The reverse matcher is built once per plan (`template_matcher`), treats
+`{stem}` / `{name}` / `{ext}` as wildcards, and refuses to build a pattern whose literal
+part is shorter than two characters — otherwise `{name}` or `{stem}.{ext}` would classify
+the entire source folder as its own output. `{ext}` in a template still gets the
+extension wildcard appended, so `{stem}_zh.{ext}` matches both `X_zh.mp4` and `X_zh.srt`;
+a template holding a placeholder the code does not know (`{title}`) refuses to build a
+pattern at all, and `config.validate` rejects such a template at save time
+(`_template_renders`) instead of letting it fail on every single file during selection.
+`selection.skipOwnOutputs: false` disables the check for anyone whose sources genuinely
+look like that, and naming a file explicitly — `--only 剧场版_zh.mp4`, or a forced rerun —
+overrides it: the skip exists to stop accidents, not to refuse a request the user typed.
+
 ## Configuration read/write rules
 
 - **Missing keys get defaults**: `describe` always returns defaults merged with the file content and unknown keys.
@@ -159,6 +206,13 @@ Because credentials stay with the host, `DSH` needs no key reference and diagnos
 
 Both ends validate: `qqbot` without an appId (and no fallback script), an appId without an openid, `command` without a
 command, or `webhook` without an http(s) URL is rejected at the field level and never written.
+
+`notify.successWhen` decides what counts as a successful round: `run` (default) reports
+success only when nothing failed, keeping the pre-1.6 behaviour, while `anyOutput` reports
+success as soon as one file came out and sends a separate failure message for the ones
+that did not — so one `anyOutput` round can send two messages. An `anyOutput` round that
+selected nothing and failed nothing stays silent; a `run` round still announces
+"本轮无新片" as it always did. Both ends validate the value against the same two options.
 
 `openid` belongs to the *recipient*: DM the bot once with your own QQ account, then copy it from the QQ Open Platform
 event log (the notification card has a helper that extracts it from a pasted message JSON). "Send test message" in the
@@ -274,6 +328,53 @@ left alone (they are inaudible for subtitles), and a negative measurement is onl
 (the default, and byte-for-byte the same style line the plugin used to hard-code), bold yellow, white at the top for
 documentaries, white on a black box, and a cinema look. A preset drives both paths: the ASS file used for bilingual
 subtitles and the `force_style` string used when burning plain subtitles.
+
+## Reasoning effort and what happens when a batch is cut off
+
+`engine.reasoningEffort` only matters for models that think before they answer. The
+value is an opaque identifier the model itself declares — the panel asks the host
+(`GET model-info?provider=…&model=…`, which calls `resolveModelInfo`) and offers
+exactly the declared levels, plus *follow the model's default*. An empty value means
+the key is **not sent**, which is how the host's own agent expresses the same thing;
+the panel therefore never invents `low` / `medium` / `high`.
+
+The interesting failure mode is a batch that hits `maxTokens` because reasoning ate
+the budget. Three things changed so a run does not quietly lose it:
+
+1. The relay answers `200` with `truncated: true`, the partial text and
+   `usage: {inputTokens, outputTokens, reasoningTokens}`. A `502` would make the
+   engine throw the batch away even though most of it had been written.
+2. The translator treats a token limit as **terminal for that batch**: re-asking the
+   same blocks with the same budget would only cut at the same place, three times,
+   billed three times. Blocks that did come back are matched by start timestamp
+   (not by position — the model reorders and skips), and the rest are re-asked in
+   halves with `SPLIT_MAX_DEPTH=3` and `SPLIT_MAX_CALLS=24`.
+3. Whatever still cannot be translated keeps the source line and is recorded. The
+   run writes `<output>.report.json` next to the subtitle file:
+
+   ```json
+   {"blocks": 118, "untranslated": 4, "untranslatedIds": [{"idx": 7, "start": "00:04:12,480", "reason": "token-limit"}],
+    "calls": {"primary": 4, "split": 3}, "truncatedBatches": 1, "failedBatches": 0,
+    "tokens": {"input": 18234, "output": 9210, "reasoning": 3106}, "reasoningEffort": "low"}
+   ```
+
+   `translation_stats()` merges it into the run result, and the completion
+   notification appends the untranslated ids, so a low-quality round comes with a
+   list instead of a percentage.
+
+Two failure shapes get their own answer instead of a generic error:
+
+- **The model does not have that effort.** The relay compares the requested level
+  with the ones the model declares and answers `422 unknown-effort` before it bills
+  anything; a provider that refuses the level mid-flight is recognised and
+  answered the same way. The engine treats it as terminal for the batch — asking
+  again gets the same refusal — so the run stops instead of paying three times for
+  the same mistake. The panel shows the same answer as a warning next to the
+  picker, and says which levels the model does have.
+- **The provider is throttling.** A quota used to arrive as a plain `502`, so the
+  engine waited a couple of seconds and asked again. It now arrives as
+  `429 rate-limited`, which the engine retries with the long backoff (20s, 40s,
+  60s) instead of the short one.
 
 ## Known limits
 

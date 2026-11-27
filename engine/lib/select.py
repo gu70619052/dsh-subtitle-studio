@@ -8,6 +8,7 @@
 
 import fnmatch
 import os
+import re
 
 GB = 1024.0 ** 3
 
@@ -18,6 +19,8 @@ REASON_TEXT = {
     "too-large": "超过体积上限",
     "too-old": "超过最大龄期",
     "translated-exists": "输出目录已有译制成品",
+    "translated-ledger": "来源片已译过（成品台账命中，成品仍在）",
+    "own-output": "看起来是本插件自己的成品（按命名模板反推）",
     "skip-list": "历史失败名单（见 state/skipped.json）",
     "quota-exhausted": "今日配额已用完",
     "quota-limit": "超出本次 maxPerRun",
@@ -79,6 +82,45 @@ def output_name(name_template, filename, ext=None):
     return result
 
 
+def template_matcher(name_template):
+    """把命名模板变成一个「这个名字像是模板产出的」匹配器。
+
+    `{stem}` / `{name}` / `{ext}` 都当通配，其余按字面。模板里没有字面
+    内容时（比如就一个 `{name}`）返回 None —— 那种模板下任何文件都可能是
+    成品，不能拿来排除，否则会把整个片源库排空。
+    """
+    template = (name_template or "").strip()
+    if not template:
+        return None
+    head, sep, tail = template.rpartition(".")
+    stem_part = head if sep else template
+    literal = stem_part
+    for token in ("{stem}", "{name}", "{ext}"):
+        literal = literal.replace(token, "")
+    # 字面部分只剩标点/扩展名时不足以认成品（`{name}` 或 `{stem}.{ext}`），
+    # 那种模板下任何文件都可能是产出，拿来排除会排空片源。
+    if len(re.sub(r"[^0-9A-Za-z一-鿿_-]", "", literal)) < 2:
+        return None
+    pattern = re.escape(stem_part)
+    for token in ("{stem}", "{name}", "{ext}"):
+        pattern = pattern.replace(re.escape(token), "[^/]*")
+    if "{" in literal:
+        # 模板里有我们不认识的占位符（`{stem.lower()}`、`{title}`…）：
+        # 那样拼出来的正则要求文件名里有字面花括号，永远匹配不上，
+        # 与其静默失效不如不启用这条规则。
+        return None
+    if sep:
+        # 扩展名放开口子：换过输出方式后旧成品是 _zh.mp4、新成品是 _zh.srt，
+        # 两种都该认出来，否则切一次模式就把历史成品全当成新片。
+        # `{stem}_zh.{ext}` 这种把扩展名写成占位符的模板同样走这里（R3）。
+        pattern = pattern + r"\.[A-Za-z0-9]+"
+    pattern = pattern + "$"
+    try:
+        return re.compile("^" + pattern)
+    except re.error:
+        return None
+
+
 def _match_any(name, patterns):
     low = name.lower()
     for pattern in patterns or []:
@@ -136,7 +178,8 @@ def _in_skip_list(skip_list, name, prefix=""):
 
 def select(files, cfg, existing_outputs=None, used_today=0,
            only=None, skip_list=None, force=False, name_template=None,
-           skip_key_prefix="", output_ext=None):
+           skip_key_prefix="", output_ext=None, translated_ledger=None,
+           skip_own_outputs=True, output_dir=None):
     """返回 {candidates, selected, counts, quota, effectiveLimit, order}。
 
     files: remote.Endpoint.list_files() 的条目
@@ -145,6 +188,12 @@ def select(files, cfg, existing_outputs=None, used_today=0,
     only: 显式指定单个文件时（force=True）绕过配额与“已翻译/失败名单”跳过
     skip_key_prefix: 多目录模式下的名单键前缀（不同目录的同名文件互不牵连）
     output_ext: 成品扩展名覆盖（SRT 模式产出 .srt，不是模板里的 .mp4）
+    translated_ledger: {源片名: 成品路径}，来自 state/translated.json 且已校验
+        成品仍在。命中即跳过 —— 这是「标签打在原视频上」的那条路，不依赖
+        当前输出目录与输出方式（REQ-59）。
+    skip_own_outputs: 名单里若有文件正好等于另一个文件的成品名，就当成自家
+        成品排掉，避免输出目录==来源目录时 `X_zh.mp4` 被再翻成 `X_zh_zh.mp4`
+        无限套（REQ-60）。
     """
     sel = cfg.get("selection") or {}
     existing_outputs = set(existing_outputs or [])
@@ -158,6 +207,19 @@ def select(files, cfg, existing_outputs=None, used_today=0,
     max_age = float(sel.get("maxAgeDays") or 0)
     excludes = sel.get("excludePatterns") or []
     order = sel.get("order") or "mtime-asc"
+    ledger = translated_ledger or {}
+    skip_own = bool(sel.get("skipOwnOutputs", True)) and bool(skip_own_outputs)
+    own_outputs = set()
+    own_re = template_matcher(template) if skip_own else None
+    output_dir_abs = os.path.normpath(os.path.expanduser(str(output_dir or ""))) if output_dir else ""
+    if skip_own:
+        # 一个文件是自家成品 ⇔ 它等于同一批里某个文件的成品名。
+        # 这样 `X_zh.mp4` 会被认出、而它自己的成品 `X_zh_zh.mp4` 就不会再被当成片源。
+        for entry in files:
+            sibling = os.path.basename(entry.get("name") or "")
+            if not sibling:
+                continue
+            own_outputs.add(output_name(template, sibling, ext=output_ext))
 
     candidates = []
     for entry in files:
@@ -176,6 +238,20 @@ def select(files, cfg, existing_outputs=None, used_today=0,
             if hit:
                 reason = "excluded"
 
+        named = bool(only) and name.lower() == str(only).lower()
+        if reason is None and skip_own and not named and name != cand["expectedOutput"]:
+            # 两条认法：① 它正好是同批某个文件的成品名；② 它长得像模板产出的
+            # 名字、且就躺在输出目录里。②覆盖「库里的成品被单独当片源」这种
+            # 情况（片源与输出同目录、或直接把成品目录当来源），而①不需要
+            # 输出目录也能命中。规则只在字面部分够长时启用，`{name}` 那种
+            # 模板不会排掉任何东西。
+            parent = os.path.normpath(os.path.dirname(entry.get("path") or ""))
+            looks_own = (name in own_outputs) or (
+                own_re is not None and output_dir_abs != "" and parent == output_dir_abs
+                and own_re.match(name) is not None)
+            if looks_own:
+                reason = "own-output"
+
         if reason is None and min_size > 0 and cand["sizeBytes"] < min_size:
             reason = "too-small"
         if reason is None and max_size > 0 and cand["sizeBytes"] > max_size:
@@ -184,9 +260,18 @@ def select(files, cfg, existing_outputs=None, used_today=0,
             reason = "too-old"
         if reason is None and skip_translated and cand["expectedOutput"] in existing_outputs:
             reason = "translated-exists"
+            cand["translatedEvidence"] = os.path.join(
+                str(cfg.get("output.path") or ""), cand["expectedOutput"])
+        if reason is None and skip_translated and name in ledger:
+            reason = "translated-ledger"
+            cand["translatedEvidence"] = ledger[name]
         if reason is None and respect_skip_list and _in_skip_list(skip_list, name, skip_key_prefix):
             reason = "skip-list"
-        if force and reason in ("translated-exists", "skip-list"):
+        # force / --only 是用户点名要处理这一条，自家成品的启发式判定要让路（R3）
+        if force and reason in ("translated-exists", "translated-ledger", "skip-list",
+                                "own-output"):
+            reason = None
+        if named and reason == "own-output":
             reason = None
 
         cand["reason"] = reason

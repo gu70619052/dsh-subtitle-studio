@@ -340,8 +340,26 @@ def translation_stats(zh_path):
         if KANA_RE.search(text) and not PLACEHOLDER_RE.match(text):
             untranslated += 1
     total = len(blocks) or 1
-    return {"blocks": len(blocks), "untranslated": untranslated,
-            "untranslatedPct": round(untranslated * 100.0 / total, 2)}
+    stats = {"blocks": len(blocks), "untranslated": untranslated,
+             "untranslatedPct": round(untranslated * 100.0 / total, 2)}
+    # translate_srt 会在产物旁边留一份自救账本；有就并进来，没有就保持旧形状。
+    try:
+        with open(zh_path + ".report.json", "r", encoding="utf-8") as handle:
+            detail = json.load(handle)
+    except Exception:  # noqa: BLE001 - 账本是加分项，缺了不影响翻译本身
+        detail = None
+    if isinstance(detail, dict):
+        stats["calls"] = detail.get("calls") or {}
+        stats["truncatedBatches"] = detail.get("truncatedBatches") or 0
+        stats["failedBatches"] = detail.get("failedBatches") or 0
+        stats["tokens"] = detail.get("tokens") or {}
+        if detail.get("reasoningEffort"):
+            stats["reasoningEffort"] = detail["reasoningEffort"]
+        ids = detail.get("untranslatedIds") or []
+        stats["untranslatedIds"] = ["#%s@%s(%s)" % (
+            entry.get("idx"), entry.get("start"), entry.get("reason"))
+            for entry in ids if isinstance(entry, dict)][:20]
+    return stats
 
 
 def engine_env(cfg):
@@ -681,6 +699,10 @@ def translate(cfg, log, source_srt, zh_srt, prompt_set):
            "--batch-size", str(build)]
     if cfg.get("engine.kind") == "dsh":
         cmd += ["--provider", provider_for_engine(cfg)]
+    # 只有 translate_srt 吃这个参数；重跑层（REQ-55）还没接，别在这里瞎传。
+    effort = (cfg.get("engine.reasoningEffort") or "").strip()
+    if effort:
+        cmd += ["--reasoning-effort", effort]
     if cfg.get("engine.kind") == "ollama":
         cmd += ["--ollama-host", cfg.get("engine.ollamaHost") or ""]
         if (cfg.get("engine.ollamaModel") or "").strip():
@@ -955,7 +977,110 @@ def record_skip(cfg, name, reason, detail="", dir_prefix="", dir_name="", source
     key = "%s%s" % (dir_prefix, name) if dir_prefix else name
     data[key] = {"reason": reason, "detail": detail, "at": now_iso(),
                  "dirName": dir_name, "sourceDir": source_dir}
-    atomic_write_json(os.path.join(cfg.state_dir, "skipped.json"), data)
+    atomic_write_json(os.path.join(cfg.state_dir, "skipped.json"), data, mode=0o600)
+
+
+TRANSLATED_FILE = "translated.json"
+# 台账条目上限：老条目按 at 时间淘汰，避免文件无限长大。
+TRANSLATED_MAX = 5000
+
+
+def translated_path(cfg):
+    return os.path.join(cfg.state_dir, TRANSLATED_FILE)
+
+
+def load_translated(cfg):
+    """成品台账：{键: {output, mode, at, sourceDir}}。
+
+    键与失败名单同一套约定：多目录时带 dir_tag 前缀，单目录就是文件名。
+    这台账回答的是「这个来源文件译过没有」，与当前输出目录、输出方式无关
+    —— 换目录或从压制切到只出字幕都不会让它失效（REQ-59）。
+    """
+    data = read_json(translated_path(cfg), {})
+    return data if isinstance(data, dict) else {}
+
+
+def record_translated(cfg, key, output, mode, source_dir=""):
+    """成功产出一部就记一笔。output 是成品绝对路径（远端是远端路径）。"""
+    if not key or not output:
+        return
+    data = load_translated(cfg)
+    data[key] = {"output": output, "mode": mode or "", "at": now_iso(),
+                 "sourceDir": source_dir or ""}
+    if len(data) > TRANSLATED_MAX:
+        ordered = sorted(data.items(),
+                         key=lambda kv: ((kv[1] or {}).get("at") or ""))
+        data = dict(ordered[-TRANSLATED_MAX:])
+    atomic_write_json(translated_path(cfg), data, mode=0o600)
+
+
+def _ledger_hits(cfg, entry, ledger, names, prefix):
+    """挑出本目录这张名单在台账里的命中：{源片名: 成品路径}。
+
+    值必须是个 dict：这文件用户可以手改，写成 {"x": "y"} 也不能崩整轮（R2）。
+    """
+    hits = {}
+    for name in names:
+        info = ledger.get((prefix + name) if prefix else name)
+        if not isinstance(info, dict):
+            continue
+        output = info.get("output") or ""
+        if output:
+            hits[name] = output
+    return hits
+
+
+def verify_ledger_hits(entry, hits, log, max_dirs=8):
+    """确认台账里的成品还在，返回 (确认还在的命中, 没能核实的条数)。
+
+    成品可能落在当前输出目录之外（换过输出目录），所以按成品所在目录分组，
+    每组建一个端点列一次目录。
+
+    关键是区分两种「没看到」（R2）：
+      - **看清了、成品不在** —— 判未译，会重译。这正是台账要修的假阳性。
+      - **没法看** —— 端点连不上、列目录报错、目录多过 max_dirs 没去列。
+        这类命中一律保留：一次核不到就重译，等于网络抖一下白烧几小时额度，
+        比暂时漏一个「成品已被手动删掉」的检出危险得多。条数会回给
+        build_plan，写进 plan 与运行日志，让用户看得见这笔账没核。
+    """
+    if not hits:
+        return {}, 0
+    by_dir = {}
+    for name, output in hits.items():
+        by_dir.setdefault(os.path.dirname(output), []).append((name, output))
+    current = os.path.abspath(os.path.expanduser(
+        ((entry.get("output") or {}).get("path") or "")))
+    verified = {}
+    unchecked = 0
+
+    def keep_unchecked(pairs, why):
+        nonlocal unchecked
+        unchecked += len(pairs)
+        for name, output in pairs:
+            verified[name] = output
+        log.warn("成品台账 %d 条未能核实（%s），暂按已译跳过——"
+                 "确认成品真不在了就删掉 state/translated.json 里的对应条目"
+                 % (len(pairs), why))
+
+    for directory, pairs in by_dir.items():
+        if len(by_dir) > max_dirs and os.path.abspath(directory) != current:
+            keep_unchecked(pairs, "成品目录多过 %d 个，没有去列" % max_dirs)
+            continue
+        output_cfg = entry.get("output") or {}
+        try:
+            endpoint = Endpoint(output_cfg.get("kind"), directory,
+                                output_cfg.get("ssh"), logger=log)
+            if not endpoint.probe().get("ok"):
+                keep_unchecked(pairs, "输出目录连不上：%s" % directory)
+                continue
+            present = set(item["name"] for item in endpoint.list_files(["*"], False))
+        except EngineError as exc:
+            keep_unchecked(pairs, "列目录失败：%s" % exc.message)
+            continue
+        for name, output in pairs:
+            if os.path.basename(output) in present:
+                verified[name] = output
+    return verified, unchecked
 
 
 def last_run_path(cfg):
@@ -989,17 +1114,23 @@ def endpoints_for(entry, log):
     return source, output
 
 
-def build_plan(cfg, log, max_override=None, only=None):
+def build_plan(cfg, log, max_override=None, only=None, write_state=True):
     """列目录 + 选片，返回 JSON 友好的 plan 字典（只读，不建目录）。
 
     多目录模式：dirs 里的每一项都参与选片，maxPerRun 是本轮全局上限。
+
+    write_state=False 给 dry-run / plan 用：这两个入口声称「无副作用」，
+    而历史上它们仍会触发失败名单的一次性键迁移写入 —— 与持锁真跑并发时
+    是 last-writer-wins，能吞掉刚记下的失败条目（R2）。
     """
     started = now_iso()
     entries = config_mod.dir_entries(cfg.data)
     log.info("目录模式：%d 个来源目录%s"
              % (len(entries), "" if len(entries) > 1 else "（单目录配置）"))
 
-    skip_list = migrate_skip_keys(cfg, config_mod.dir_entries(cfg.data), log) or load_skip_list(cfg)
+    skip_list = migrate_skip_keys(cfg, config_mod.dir_entries(cfg.data), log,
+                                  write=write_state) or load_skip_list(cfg)
+    ledger = load_translated(cfg)
     usage = load_usage(cfg)
     used_today = usage["count"]
 
@@ -1069,12 +1200,25 @@ def build_plan(cfg, log, max_override=None, only=None):
 
         # 多目录时失败名单按目录隔离，避免不同目录的同名文件互相牵连
         skip_prefix = dir_tag(entry) if len(entries) > 1 else ""
+        # 台账：先按名单挑命中，再确认成品还在（换过输出目录也能认出来）
+        raw_hits = _ledger_hits(cfg, entry, ledger, [item["name"] for item in files],
+                               skip_prefix)
+        verified_hits, ledger_unchecked = verify_ledger_hits(entry, raw_hits, log)
+        missing_hits = len(raw_hits) - len(verified_hits)
+        if missing_hits > 0:
+            log.warn("成品台账命中 %d 个，其中 %d 个成品已不在，按未译处理"
+                     % (len(raw_hits), missing_hits))
         picked = selection.select(files, cfg, existing_outputs=existing,
+                                  # 用端点解析后的路径（Endpoint.path 已经过 expand）：
+                                  # 配置里写 $MEDIA/out 或 ~ 时，文件列表里是展开后的
+                                  # 绝对路径，比 describe() 那种 "local:/x" 标签比得上（R3）
+                                  output_dir=output.path,
                                   used_today=quota_used, only=only,
                                   skip_list=skip_list, force=force,
                                   name_template=output_cfg.get("nameTemplate"),
                                   skip_key_prefix=skip_prefix,
-                                  output_ext="srt" if output_mode(cfg) == "srt" else None)
+                                  output_ext="srt" if output_mode(cfg) == "srt" else None,
+                                  translated_ledger=verified_hits)
         quota_used += len(picked["selected"])
         for candidate in picked["candidates"]:
             candidate["dirIndex"] = entry["index"]
@@ -1086,6 +1230,11 @@ def build_plan(cfg, log, max_override=None, only=None):
             "index": entry["index"],
             "name": entry["name"],
             "reachable": True,
+            "ledger": {
+                "hits": len(verified_hits),
+                "missing": missing_hits,
+                "unchecked": ledger_unchecked,
+            },
             "source": {
                 "kind": source_cfg.get("kind"),
                 "path": source_cfg.get("path"),
@@ -1254,7 +1403,7 @@ def dir_tag(entry):
 _LEGACY_DIR_KEY = re.compile(r"^\[(\d+)\] (.+)$")
 
 
-def migrate_skip_keys(cfg, entries, log=None):
+def migrate_skip_keys(cfg, entries, log=None, write=True):
     """把历史名单里按目录序号写入的键换成稳定标签（一次性，幂等）。
 
     序号键按「当时第 N 个目录」解释；这里只能按「现在第 N 个目录」近似。
@@ -1281,7 +1430,10 @@ def migrate_skip_keys(cfg, entries, log=None):
             changed = True
         if new_key not in out:
             out[new_key] = value
-    if changed:
+    if changed and not write:
+        if log is not None:
+            log.info("失败名单需要迁移，但本次是只读运行（dry-run / plan），未写入")
+    elif changed:
         try:
             atomic_write_json(path, out)
             if log is not None:
@@ -1482,6 +1634,11 @@ class Pipeline(object):
             result["stage"] = "done"
             result["translation"] = stats
             result["promptProfile"] = prompt_set["profileName"] or "default"
+            # 成品台账：记「这部来源片译过了」，键带目录前缀，值与当前输出
+            # 目录/输出方式无关 —— 换目录、换输出方式下次仍认得出（REQ-59）。
+            record_translated(self.cfg, self.skip_prefix(ctx) + name,
+                              result["output"], mode,
+                              (ctx["entry"].get("source") or {}).get("path") or "")
 
             # 10) 清理中间产物
             self._cleanup(work_dir, video, uploaded=bool(upload.get("uploaded")))
@@ -1627,24 +1784,57 @@ def execute(cfg, log, plan, dry_run=False, notify_module=None):
             break
 
     payload["finishedAt"] = now_iso()
-    write_last_run(cfg, payload)
+    payload["abort"] = abort
     totals = payload["totals"]
+    # 中止时账要平：选中数里剩下的那些不是失败，是「没轮到」
+    totals["notRun"] = max(0, totals["selected"] - totals["ok"]
+                           - totals["skipped"] - totals["failed"])
+    write_last_run(cfg, payload)
     summary = "选中 %d，成功 %d，跳过 %d，失败 %d" % (
         totals["selected"], totals["ok"], totals["skipped"], totals["failed"])
+    if totals["notRun"]:
+        summary += "，未处理 %d（本轮中止）" % totals["notRun"]
     log.info("本轮结束：%s" % summary)
 
     if notify_module:
-        from lib.notify import should_notify
-        event = "success" if totals["failed"] == 0 and abort is None else "failure"
-        if should_notify(cfg, event):
+        from lib.notify import should_notify, resolve_events
+        # 成功与失败各自独立判定（REQ-46）：
+        #   run        = 旧语义，整轮零失败才算成功（空跑也算成功）
+        #   anyOutput  = 至少有产出一部就算成功；空跑不报成功也不报失败
+        # 失败永远照报 —— 部分成功时用户既该知道「成了几部」也该知道「差在哪」。
+        events = resolve_events(cfg, totals, results, abort)
+        for event in events:
+            if not should_notify(cfg, event):
+                continue
             lines = ["%s" % summary]
             for item in results:
-                if item["status"] == "failed":
+                if item["status"] == "failed" and event != "success":
                     lines.append("失败：%s（%s）" % (item["name"], item["message"][:80]))
                 elif item["status"] == "ok" and item.get("output"):
                     lines.append("产出：%s" % os.path.basename(item["output"]))
-            notify_module.send(cfg, "处理完成" if event == "success" else "处理有失败",
-                               "\n".join(lines), log)
+                    detail = item.get("translation") or {}
+                    # 成品缺一半时通知也要说清楚是几条、卡在哪，否则「成功」
+                    # 这两个字会让人以为整片都翻好了。
+                    if detail.get("untranslated"):
+                        sample = "、".join(detail.get("untranslatedIds") or [])
+                        lines.append("未译：%d 条%s" % (
+                            detail["untranslated"], ("（%s）" % sample) if sample else ""))
+                    if detail.get("truncatedBatches"):
+                        lines.append("截断：%d 批在预算处被切断" % detail["truncatedBatches"])
+            # 两条一起发时正文不互相抄：成功那条列产出，失败那条列失败原因，
+            # 只在确实有产出时补一句计数，免得「处理有失败」里塞满文件名（R3）。
+            if event == "failure":
+                failures = [line for line in lines[1:] if line.startswith("失败：")]
+                produced_lines = [line for line in lines[1:] if line.startswith("产出：")]
+                details = [line for line in lines[1:]
+                           if not line.startswith("失败：") and not line.startswith("产出：")]
+                lines = ["%s" % summary] + failures + details
+                if produced_lines:
+                    lines.append("另有 %d 部已产出（明细见成功通知）" % len(produced_lines))
+            title = {"success": "处理完成", "failure": "处理有失败"}.get(event, "处理完成")
+            if event == "success" and totals["selected"] == 0:
+                title = "本轮无新片"
+            notify_module.send(cfg, title, "\n".join(lines), log)
     return payload
 
 

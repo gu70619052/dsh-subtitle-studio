@@ -126,6 +126,21 @@ const fakeLlm = {
     }
     return table[provider] ?? []
   },
+  async resolveModelInfo(provider, model) {
+    return {
+      provider,
+      id: model,
+      name: model,
+      defaultMaxTokens: 8000,
+      reasoning: {
+        efforts: [
+          { id: 'low', name: 'Low' },
+          { id: 'high', name: 'High', description: 'more thinking' },
+        ],
+        defaultEffort: 'low',
+      },
+    }
+  },
   async *stream(options) {
     llmCalls.push(options)
     yield { type: 'text-delta', index: 0, text: 'pong' }
@@ -156,6 +171,11 @@ await import(pathToFileURL(path.join(PACKAGE, 'index.js')).href).then((module) =
 /* ------------------- QQ Bot notify bridge (mocked, no keychain) ------------------- */
 
 // 真实路由会读 macOS 钥匙串、并让引擎真发 QQ 消息；这里全部拦掉，只验证 UI 契约。
+// v1.6：面板断言要伪造 describe 的几段状态（自检结果、首装状态），
+// 否则要么真跑 brew、要么依赖沙箱里那份配置的偶然值。
+const uiOverrides = { patch: null, last: null }
+const fixMock = { calls: [], next: null }
+
 const notifyMock = {
   secretConfigured: false,
   secretCalls: [],
@@ -240,6 +260,8 @@ interceptRoute('/api/dsh-subtitle-studio/describe', (payload) => {
     qqSecretService: 'subtitle-studio-qqbot',
     qqSendPath: '',
   }
+  if (uiOverrides.last === null) uiOverrides.last = JSON.parse(JSON.stringify(data))
+  if (uiOverrides.patch !== null) Object.assign(data, uiOverrides.patch)
   return payload
 })
 
@@ -267,6 +289,22 @@ routes.set('/api/dsh-subtitle-studio/notify-test', {
       code: 'notify-failed',
       error: notifyMock.reason,
       data: { sent: false, reason: notifyMock.reason },
+    })
+  },
+})
+
+routes.set('/api/dsh-subtitle-studio/fix-dep', {
+  path: '/api/dsh-subtitle-studio/fix-dep',
+  async handler(request, response) {
+    const body = await readRequestBody(request)
+    fixMock.calls.push(body)
+    if (fixMock.next !== null) {
+      sendJson(response, 200, fixMock.next)
+      return
+    }
+    sendJson(response, 200, {
+      ok: true,
+      data: { action: body.action, command: 'brew install ffmpeg-full', stdout: 'fake install ok', durationMs: 42 },
     })
   },
 })
@@ -852,9 +890,34 @@ check('every field path has a zh label', missingFields.length === 0, missingFiel
 check('every field path has an en label', fieldPaths.every((fieldPath) => dict.en[`f.${fieldPath}`] !== undefined))
 const missingLiterals = [...new Set(literalKeys)].filter((key) => dict.zh[key] === undefined || dict.en[key] === undefined)
 check('every literal i18n key exists in both locales', missingLiterals.length === 0, missingLiterals.join(', '))
-const enumOptions = new Set((describeResponse.data.fields || []).filter((field) => field.kind === 'enum').flatMap((field) => field.options))
-const missingOptions = [...enumOptions].filter((option) => dict.zh[`o.${option}`] === undefined)
+// 与 client.js 的查表顺序一致：先字段专属键 o.<path>.<值>，再全局 o.<值>。
+const labelled = (field, option) =>
+  dict.zh[`o.${field.path}.${option}`] !== undefined || dict.zh[`o.${option}`] !== undefined
+const enumFields = (describeResponse.data.fields || []).filter((field) => field.kind === 'enum')
+const missingOptions = enumFields
+  .flatMap((field) => (field.options || []).filter((option) => !labelled(field, option)).map((option) => `${field.path}.${option}`))
 check('every enum option has a label', missingOptions.length === 0, missingOptions.join(', '))
+// STRINGS 里同一个键写两次 = 后一条静默覆盖前一条（历史上 o.faster 就这么
+// 被 ffmpeg 预置盖掉了转写引擎的标签）。字典本身看不出冲突，只能扫源码。
+const stringsBlock = source.slice(source.indexOf('const STRINGS = {'))
+const keyCounts = new Map()
+for (const match of stringsBlock.matchAll(/^\s{4,6}'([^']+)':\s*\[/gm)) {
+  keyCounts.set(match[1], (keyCounts.get(match[1]) || 0) + 1)
+}
+const duplicated = [...keyCounts].filter(([, count]) => count > 1).map(([key]) => key)
+check('no i18n key is defined twice', duplicated.length === 0, duplicated.join(', '))
+// 跨字段同名选项（ffmpeg 预置的 faster vs 转写引擎的 faster）必须各归各的标签
+const labelOf = (fieldPath, option) => {
+  const field = enumFields.find((entry) => entry.path === fieldPath)
+  if (field === undefined) return `no field ${fieldPath}`
+  const scoped = `o.${fieldPath}.${option}`
+  if (dict.zh[scoped] !== undefined) return dict.zh[scoped]
+  return dict.zh[`o.${option}`] !== undefined ? dict.zh[`o.${option}`] : option
+}
+check('the two faster options do not share a label',
+  labelOf('burn.preset', 'faster') === 'faster'
+  && labelOf('transcribe.engine', 'faster').includes('faster-whisper'),
+  `${labelOf('burn.preset', 'faster')} / ${labelOf('transcribe.engine', 'faster')}`)
 /* Hints are looked up dynamically (`h.${field.path}`) behind a
    `STRINGS[key] !== undefined` guard, so a misspelled key renders nothing and
    the literal-key scan above cannot see it. Hints are optional per field, but
@@ -925,6 +988,33 @@ check('no hardcoded colours', /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(source) === fal
       call !== undefined && call.provider === 'provider-b' && call.model === 'model-beta' && llmCalls.length === llmBefore + 1,
       JSON.stringify({ provider: call?.provider, model: call?.model }))
     check('engine tab: the DSH answer is reported', tested.text.includes('pong') || tested.text.includes('模型可用'))
+  }
+
+  // The reasoning effort: the model says which ones it has, and the panel
+  // offers exactly those.
+  {
+    const tree = await render(() => React.createElement(moduleExports.Panel))
+    const select = tagNodes(tree, 'select').find((node) => (node.props.children ?? []).flat(6)
+      .some((c) => c?.type === 'optgroup'))
+    select.props.onChange({ target: { value: 'dsh::provider-b::model-beta' } })
+    const dsh = await render(() => React.createElement(moduleExports.Panel))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const dsh2 = await render(() => React.createElement(moduleExports.Panel))
+    const effortSelect = tagNodes(dsh2, 'select').find((node) => (node.props.children ?? []).flat(4)
+      .some((c) => c?.props?.value === 'low'))
+    check('engine tab: the reasoning-effort dropdown lists what the model declares',
+      effortSelect !== undefined && dsh2.text.includes('Low') && dsh2.text.includes('High'),
+      `effortSelect=${effortSelect !== undefined}`)
+    if (effortSelect !== undefined) {
+      effortSelect.props.onChange({ target: { value: 'high' } })
+      const picked = await render(() => React.createElement(moduleExports.Panel))
+      const after = tagNodes(picked, 'select').find((node) => (node.props.children ?? []).flat(4)
+        .some((c) => c?.props?.value === 'low'))
+      check('engine tab: picking an effort writes it into the config',
+        after?.props?.value === 'high', `value=${after?.props?.value}`)
+      check('engine tab: an effort the model declares is not warned about',
+        picked.text.includes('不在这个模型声明的档位里') === false)
+    }
   }
 
   // The same button must probe Ollama instead of spending DSH credits.
@@ -1096,6 +1186,222 @@ check('no hardcoded colours', /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(source) === fal
       again !== undefined && String(again.props.value) === 'faster',
       again === undefined ? 'select gone after the change' : String(again.props.value))
   }
+}
+
+/* ---------------- v1.6：一键补依赖、首装引导、两个新键 ---------------- */
+{
+  const tree = () => render(() => React.createElement(moduleExports.Panel))
+  const openTab = async (label) => {
+    button(await tree(), label).props.onClick()
+    return tree()
+  }
+  // describe 只在挂载与重新自检时取，所以覆盖后要逼一次刷新。
+  const refresh = async () => {
+    button(await tree(), '重新自检').props.onClick()
+    await tree()
+    return tree()
+  }
+  const switches = (node) => {
+    const list = []
+    walk(node, (entry) => {
+      if (entry.tag === 'button' && entry.props.role === 'switch') list.push(entry)
+    })
+    return list
+  }
+  const baseConfig = () => uiOverrides.last.config
+  const activeTab = (node) => {
+    let name = ''
+    walk(node, (entry) => {
+      if (entry.tag === 'button' && entry.props['aria-selected'] === true) name = String(entry.text).trim()
+    })
+    return name
+  }
+  const broken = {
+    at: new Date().toISOString(),
+    atMs: Date.now(),
+    verdict: 'degraded',
+    summary: { ok: 4, warn: 0, error: 2 },
+    checks: [
+      { name: 'ffmpeg.filters', group: '依赖', level: 'error', message: '缺 ass/subtitles 滤镜', detail: { hint: 'brew install ffmpeg-full' } },
+      { name: 'whisper.model', group: '依赖', level: 'error', message: 'whisper 模型未缓存', detail: {} },
+    ],
+  }
+  uiOverrides.patch = {
+    selfcheck: broken,
+    fixDeps: {
+      byCheck: { 'ffmpeg.filters': 'brew-ffmpeg-full' },
+      labels: { 'brew-ffmpeg-full': 'brew install ffmpeg-full', 'pip-mlx-whisper': 'python3 -m pip install --user mlx-whisper' },
+    },
+  }
+  await openTab('概览')
+  const ov = await refresh()
+  const installButtons = inspect(ov).buttons.filter((node) => String(node.text).trim().startsWith('安装'))
+  check('v1.6 overview: a fixable dependency offers a button naming the exact command',
+    hasButton(ov, '安装 · brew install ffmpeg-full'),
+    installButtons.map((node) => String(node.text).trim()).join(' | '))
+  check('v1.6 overview: a model weight is explained by hand, never one-clicked',
+    installButtons.length === 1 && ov.text.includes('留给你自己决定'),
+    `buttons=${installButtons.length}`)
+
+  fixMock.calls.length = 0
+  button(ov, '安装 · brew install ffmpeg-full').props.onClick()
+  const after = await tree()
+  check('v1.6 fix-dep: the panel sends only the action id plus an explicit confirm',
+    fixMock.calls.length === 1 && fixMock.calls[0].confirm === true &&
+      fixMock.calls[0].action === 'brew-ffmpeg-full' &&
+      !('command' in fixMock.calls[0]) && !('args' in fixMock.calls[0]),
+    JSON.stringify(fixMock.calls[0] ?? {}))
+  check('v1.6 fix-dep: a finished install says so and the card re-reads itself',
+    after.text.includes('安装命令已结束') && after.text.includes('42ms'),
+    after.text.includes('安装命令已结束') ? 'done chip present' : after.text.slice(0, 160))
+
+  fixMock.next = { ok: false, error: '安装命令失败（模拟）' }
+  button(after, '安装 · brew install ffmpeg-full').props.onClick()
+  const failed = await tree()
+  check('v1.6 fix-dep: a failed command surfaces on the same card',
+    failed.text.includes('安装失败：安装命令失败（模拟）'),
+    failed.text.includes('安装失败') ? 'failure text present' : 'missing')
+  fixMock.next = null
+
+  // 同意闸门（R1）：确认只有原生对话框一条路时，取消必须有反馈；
+  // 宿主没有 window.confirm 时（DshNative 形态）必须改成卡片内确认，绝不静默放行。
+  {
+    const realConfirm = globalThis.window.confirm
+    let asked = null
+    globalThis.window.confirm = (text) => { asked = text; return false }
+    fixMock.calls.length = 0
+    button(ov, '安装 · brew install ffmpeg-full').props.onClick()
+    const declined = await tree()
+    check('v1.6 fix-dep: declining the dialog runs nothing and says so',
+      fixMock.calls.length === 0 && declined.text.includes('已取消，没有执行任何东西'),
+      `calls=${fixMock.calls.length} hasText=${declined.text.includes('已取消')}`)
+    check('v1.6 fix-dep: the dialog quotes the exact command before anything runs',
+      asked !== null && asked.includes('brew install ffmpeg-full'), String(asked).slice(0, 90))
+
+    // 宿主侧没有原生对话框（DshNative 的 window 上没有 confirm）
+    globalThis.window.confirm = undefined
+    const noDialog = await refresh()
+    button(noDialog, '安装 · brew install ffmpeg-full').props.onClick()
+    const asking = await tree()
+    check('v1.6 fix-dep: with no native dialog the card asks in place instead of running',
+      fixMock.calls.length === 0 && hasButton(asking, '确认安装') && hasButton(asking, '取消'),
+      `calls=${fixMock.calls.length}`)
+    button(asking, '取消').props.onClick()
+    const dismissed = await tree()
+    check('v1.6 fix-dep: cancelling the in-card ask runs nothing',
+      fixMock.calls.length === 0 && !hasButton(dismissed, '确认安装'),
+      `calls=${fixMock.calls.length}`)
+    button(dismissed, '安装 · brew install ffmpeg-full').props.onClick()
+    const askingAgain = await tree()
+    button(askingAgain, '确认安装').props.onClick()
+    const confirmed = await tree()
+    check('v1.6 fix-dep: the in-card confirm is what finally posts, with confirm:true',
+      fixMock.calls.length === 1 && fixMock.calls[0].confirm === true &&
+        confirmed.text.includes('安装命令已结束'),
+      JSON.stringify(fixMock.calls))
+    globalThis.window.confirm = realConfirm
+  }
+
+  // 首装引导：把 config 打到「什么都没填」，五步应全为待办
+  uiOverrides.patch = {
+    exists: false,
+    selfcheck: broken,
+    run: { ...baseConfig() && uiOverrides.last.run, current: null, last: null, history: [] },
+    config: {
+      ...baseConfig(),
+      engine: { ...baseConfig().engine, kind: 'dsh', provider: '', model: '' },
+      source: { ...baseConfig().source, path: '' },
+      output: { ...baseConfig().output, path: '' },
+      schedule: { ...baseConfig().schedule, enabled: false, mode: 'launchd' },
+    },
+  }
+  await openTab('概览')
+  const fresh = await refresh()
+  check('v1.6 first run: an untouched install opens with the five-step card at 0/5',
+    fresh.text.includes('从这里开始：五步出第一版字幕（0/5）'),
+    (fresh.text.match(/从这里开始[^]{0,24}/) || ['none'])[0])
+  check('v1.6 first run: every step is named, and each step with somewhere to go offers the jump',
+    ['装好依赖（ffmpeg 与转写引擎）', '选一个翻译模型', '填来源目录和输出目录', '先预演，再试跑一部', '设置定时（可选）']
+      .every((label) => fresh.text.includes(label)) &&
+      hasButton(fresh, '去设置 · 引擎') && hasButton(fresh, '去设置 · 来源与输出') && hasButton(fresh, '去设置 · 调度'),
+    inspect(fresh).buttons.filter((n) => String(n.text).includes('去设置')).map((n) => String(n.text).trim()).join(' | '))
+  check('v1.6 first run: nothing is ticked while nothing is configured',
+    (fresh.text.match(/已完成/g) || []).length === 0 && (fresh.text.match(/待办/g) || []).length === 5,
+    `done=${(fresh.text.match(/已完成/g) || []).length} todo=${(fresh.text.match(/待办/g) || []).length}`)
+
+  button(fresh, '去设置 · 来源与输出').props.onClick()
+  const jumped = await tree()
+  check('v1.6 first run: the shortcut really switches to that tab',
+    activeTab(jumped) === '来源与输出', activeTab(jumped))
+
+  // 配置补齐后：同一份清单应当全部打勾、不再给出按钮
+  uiOverrides.patch = {
+    exists: false,
+    selfcheck: { ...broken, verdict: 'green', summary: { ok: 6, warn: 0, error: 0 }, checks: [] },
+    run: { current: null, last: { runId: 'r1' }, history: [] },
+    config: {
+      ...baseConfig(),
+      engine: { ...baseConfig().engine, kind: 'dsh', provider: 'mock', model: 'mock-model' },
+      source: { ...baseConfig().source, path: '/tmp/src' },
+      output: { ...baseConfig().output, path: '/tmp/out' },
+      schedule: { ...baseConfig().schedule, enabled: true, mode: 'launchd' },
+    },
+  }
+  await openTab('概览')
+  const done = await refresh()
+  check('v1.6 first run: the checklist follows the live state, not a static blurb',
+    done.text.includes('从这里开始：五步出第一版字幕（5/5）') &&
+      (done.text.match(/已完成/g) || []).length === 5 &&
+      inspect(done).buttons.filter((n) => String(n.text).includes('去设置')).length === 0,
+    `done=${(done.text.match(/已完成/g) || []).length} go=${inspect(done).buttons.filter((n) => String(n.text).includes('去设置')).length}`)
+
+  uiOverrides.patch = { ...uiOverrides.patch, exists: true }
+  await openTab('概览')
+  const written = await refresh()
+  check('v1.6 first run: the card is gone once a config file exists',
+    written.text.includes('从这里开始') === false,
+    `patch.exists=${uiOverrides.patch.exists} snip=${(written.text.match(/从这里开始[^]{0,28}/) || ['none'])[0]}`)
+
+  // 两个新键：通知口径 + 自家成品开关
+  const quality = await openTab('画质音频')
+  const whenSelect = tagNodes(quality, 'select').find((node) => {
+    const values = (node.children ?? []).flat(4).map((child) => child?.props?.value)
+    return values.includes('anyOutput') && values.includes('run')
+  })
+  check('v1.6 notify: 算作成功的条件 is a real choice with both modes',
+    whenSelect !== undefined && String(whenSelect.props.value) === 'run',
+    whenSelect === undefined ? 'select not found' : String(whenSelect.props.value))
+  check('v1.6 notify: both modes are labelled in words, not jargon',
+    quality.text.includes('整轮成功才算') && quality.text.includes('有产出就算成功'))
+  if (whenSelect !== undefined) {
+    whenSelect.props.onChange({ target: { value: 'anyOutput' } })
+    const moved = await tree()
+    const again = tagNodes(moved, 'select').find((node) => {
+      const values = (node.children ?? []).flat(4).map((child) => child?.props?.value)
+      return values.includes('anyOutput') && values.includes('run')
+    })
+    check('v1.6 notify: the choice survives a re-render',
+      again !== undefined && String(again.props.value) === 'anyOutput',
+      again === undefined ? 'select gone' : String(again.props.value))
+  }
+
+  const sel = await openTab('选片')
+  check('v1.6 selection: the own-output switch is presented with its reason',
+    sel.text.includes('跳过自家成品') && sel.text.includes('避免把成品再翻一遍'))
+  const ownSwitch = switches(sel).find((node) => node.props['aria-label'] === '跳过自家成品')
+  check('v1.6 selection: the switch is a real toggle defaulting to on',
+    ownSwitch !== undefined && ownSwitch.props['aria-checked'] === true,
+    ownSwitch === undefined ? `switches=${switches(sel).length}` : String(ownSwitch.props['aria-checked']))
+  if (ownSwitch !== undefined) {
+    ownSwitch.props.onClick()
+    const selOff = await tree()
+    const again = switches(selOff).find((node) => node.props['aria-label'] === '跳过自家成品')
+    check('v1.6 selection: turning it off is remembered in the draft',
+      again !== undefined && again.props['aria-checked'] === false,
+      again === undefined ? 'switch gone after the change' : String(again.props['aria-checked']))
+  }
+
+  uiOverrides.patch = null
 }
 
 server.close()

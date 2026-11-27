@@ -36,6 +36,45 @@ def should_notify(cfg, event):
     return bool(notify.get(key)) if key else False
 
 
+def resolve_events(cfg, totals, results, abort=None):
+    """决定这一轮要发哪些事件（REQ-46）。
+
+    旧实现只有一个二值判断：`failed == 0 且没中止` → success，否则 failure。
+    三个说不清的地方：部分成功只发失败通知、零选中空跑也算「处理完成」、
+    全局中止时哪怕已经产出几部也整体判失败。现在按两种口径分开算：
+
+    - run（默认，保旧语义）：整轮零失败才算成功；空跑也发成功（旧行为）
+    - anyOutput：至少有产出一部就算成功；空跑既不发成功也不发失败
+
+    失败永远独立判定并单独发一条 —— 一次跑可能同时发成功和失败两条。
+    """
+    notify = cfg.get("notify") or {}
+    produced = 0
+    for item in results or []:
+        if item.get("status") == "ok" and item.get("output"):
+            produced += 1
+    # 产出口径与 totals 对齐：totals["ok"] 才是这一轮的账，results 只是明细
+    # （两者本来同源，但 dry-run 或异常截断时 results 可能更短，别让它单独决定）
+    failed = int((totals or {}).get("failed") or 0)
+    produced = max(produced, int((totals or {}).get("ok") or 0)) if results else produced
+    selected = int((totals or {}).get("selected") or 0)
+    broken = failed > 0 or abort is not None
+    when = notify.get("successWhen") or "run"
+
+    events = []
+    if when == "anyOutput":
+        if produced > 0:
+            events.append("success")
+        elif selected == 0 and not broken:
+            pass  # 空跑：既没产出也没失败，不打扰
+    else:
+        if not broken:
+            events.append("success")
+    if broken:
+        events.append("failure")
+    return events
+
+
 def _compose(title, body):
     text = "%s%s" % (PREFIX, title)
     if body:

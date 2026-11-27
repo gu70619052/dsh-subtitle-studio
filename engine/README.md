@@ -129,6 +129,35 @@ paths{dataDir,workDir,logsDir,stateDir}, logs{runLog,sizeBytes,workerLogSizeByte
   `transcribe.temperature`（0–2，0 = 只走最可能一次）、`transcribe.hallucinationSilenceThreshold`、
   `transcribe.minAvgLogprob`（≤0）、`transcribe.maxNoSpeechProb`（0–1）、
   `transcribe.keepThanksPhrases`、`transcribe.keepRepeats`。
+- v1.5 新增键：`engine.reasoningEffort`（模型自己声明的思考档位；空串 = 不下发该键，跟随模型默认。
+  非空时只接受 `^[A-Za-z0-9._-]{1,40}$`）。
+- 中转错误分类（v1.5）：`422 unknown-effort`（模型没有这个档位；宿主在开流之前比对模型声明的档位，
+  不符就不花钱）与 `429 rate-limited`（provider 限流）都是确定性答案：引擎不重试前者，后者按
+  20/40/60 秒长退避重试。判定依据是错误体里的 `code`，不是状态码。
+- 截断自救（`vendor/translate_srt.py`）：中转对 `finish=max-tokens` 回 `200 + truncated:true` + 已写出正文 +
+  `usage.reasoningTokens`；引擎把 `token-limit` 视为该批的确定性结论（不再同参重试），按起始时间戳收下能对上的块，
+  其余对半拆小重问（`SPLIT_MAX_DEPTH=3`、`SPLIT_MAX_CALLS=24`），仍缺的保留原文并写进
+  `<输出>.report.json`（`untranslatedIds` 带 `idx/start/reason`，另有 `calls` / `truncatedBatches` /
+  `failedBatches` / `tokens` / `reasoningEffort`）；`lib/pipeline.py:translation_stats()` 把它并进运行结果与通知。
+- v1.6 新增键：`selection.skipOwnOutputs`（默认 true；来源与输出同目录时，按命名模板反推出
+  自家成品并跳过，避免 `X_zh_zh.mp4`）、`notify.successWhen`（`run|anyOutput`：`run` 要求零失败
+  才发成功通知，`anyOutput` 有产出即成功并另发失败通知）。
+- 已译台账（v1.6）：每部成品在成功上传后写进 `state/translated.json`
+  （`{key, output, mode, at, sourceDir}`，键带多目录标签，上限 5000 条按 `at` 淘汰）。选片时
+  **先查台账、再核对成品是否还在**：`verify_ledger_hits()` 按成品所在目录分组各列一次目录
+  （最多 8 个），返回「核实通过」与「未核实条数」两个数——**只看过的目录才有否决权**：
+  成品确实不在就判未译并重译（宁可多花一轮，也不把删掉的成品当成已译），而连不上 / 列目录
+  报错 / 超出 8 个没去看的，保留记录并计入未核实（NAS 掉线一晚不该换来整库重译）。
+  plan 每目录报 `ledger: {hits, missing, unchecked}`。命中记为 `translated-ledger`，与
+  「期望文件名就在输出目录里」的 `translated-exists` 并列，两者都带 `translatedEvidence`
+  （被核对的绝对路径）。
+- 只读运行（`plan`、`run --dry-run`）不再落任何 state：v1.6 前它们仍会触发失败名单的
+  一次性键迁移写入，与持锁真跑并发时能吞掉刚记下的条目（`build_plan(..., write_state=False)`）。
+- 命名模板在保存时就会试渲染一次（`config._template_renders`）：`{stem[:10]}`、`{stem.lower()}`
+  这类写法以前要到选片阶段才炸，而且每个文件炸一次。
+- 本轮没能开始也要说话：`subtitle-run` 在 plan 阶段抛 EngineError（依赖缺、来源不可达、
+  磁盘不足）时按 `notify.onFailure` 补发一条「本轮未能开始：…」；拿锁失败（已有实例在跑）
+  仍然静默，那是重叠触发不是故障。
 - 引擎凭据解析顺序：环境变量（`MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `SUBTITLE_API_KEY`）
   → keychain（`apiKeyRef`，三策略：`-l` / `-a + -s` / `-s`）。
 
@@ -173,7 +202,9 @@ paths{dataDir,workDir,logsDir,stateDir}, logs{runLog,sizeBytes,workerLogSizeByte
 6. **prefilter**：`vendor/prefilter_and_rerun.py --no-rerun` 生成 `source.srt.prefilter`（纯假名/短假名/广告宣番打占位符）。
 7. **translate**：`vendor/translate_srt.py`，system prompt 来自配置（`--system-file`），支持
    `dsh | minimax | ollama | deepseek | openai-compatible`，可注入 `--video-context` 与 `--series`（术语表名字，词表文件在用户数据目录
-   `~/.dsh/data/subtitle-studio/series/<名字>.json`，包内不预置）。
+   `~/.dsh/data/subtitle-studio/series/<名字>.json`，包内不预置）；`--reasoning-effort` 只在
+   `engine.reasoningEffort` 非空时下发。批内失败不再整批回退：能对上时间戳的块先收下，缺的对半拆小重问
+   （深度/次数封顶），成品旁边留 `<输出>.report.json` 账本。
 8. **retry**：`vendor/retry_translate.py` 针对「仍是日文且无中文」的条目小批量重翻。
 9. **quality-gate**：日文残留比例/条数超过阈值时，用 `prefilter_and_rerun.py` 的重跑模式二次修复。
 10. **trim-silence**（`subtitles.trimSilence`）：`vendor/trim_silence.py` 用音频能量收缩每条字幕的起止。

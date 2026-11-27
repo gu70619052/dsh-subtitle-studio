@@ -54,6 +54,9 @@ process.env.SUBTITLE_STUDIO_ENGINE = path.join(HERE, 'mock', 'subtitle-run')
 process.env.FAKE_LAUNCHD_STATE = LAUNCHD_STATE
 process.env.FAKE_LAUNCHCTL_LOG = LAUNCHCTL_LOG
 process.env.FAKE_LAUNCHCTL_STATE = path.join(LAUNCHD_STATE, 'loaded-labels.txt')
+// The relay remembers what a model declares for a minute; these tests flip
+// the fake catalogue on and off, so the memory has to be off here.
+process.env.SUBTITLE_STUDIO_EFFORT_CACHE_MS = '0'
 process.env.PATH = `${path.join(HERE, 'bin')}:${process.env.PATH ?? ''}`
 
 const results = []
@@ -100,9 +103,33 @@ function makeFakeLlm() {
     listProviders: () => [{ id: 'fake-provider', name: 'Fake Provider' }],
     listModels: async (provider) =>
       provider === 'fake-provider' ? [{ provider, id: 'fake-model', name: 'Fake Model' }] : [],
+    async resolveModelInfo(provider, model) {
+      return {
+        provider,
+        id: model,
+        name: 'Fake Model',
+        defaultMaxTokens: 8000,
+        reasoning: declaredEfforts
+          ? {
+              efforts: [
+                { id: 'low', name: 'Low' },
+                { id: 'high', name: 'High', description: 'more thinking' },
+              ],
+              defaultEffort: 'low',
+            }
+          : undefined,
+      }
+    },
     async *stream(options) {
       calls.push(options)
       if (holdGate) await holdGate
+      // A provider that refuses the effort, or that says "slow down", has to
+      // reach the caller as its own answer, not as a generic broken stream.
+      if (throwWith !== '') {
+        const message = throwWith
+        throwWith = ''
+        throw new Error(message)
+      }
       // The llm seam takes session-shaped messages: a user message carries
       // typed content blocks. A bare string here fails inside the adapters.
       const content = options.messages?.[0]?.content
@@ -110,14 +137,28 @@ function makeFakeLlm() {
       if (content[0]?.type !== 'text' || typeof content[0]?.text !== 'string') {
         throw new TypeError('user message content must start with a text block')
       }
+      if (truncateNext) {
+        // Exactly what a thinking model does with too small a budget: it spends
+        // the tokens on reasoning, writes half a batch and gets cut off.
+        yield { type: 'reasoning-delta', index: 0, text: 'thinking about the tone' }
+        yield { type: 'block-start', index: 1, blockType: 'text' }
+        yield { type: 'text-delta', index: 1, text: '1\n00:00:01,000 --> 00:00:02,000\n你好' }
+        yield { type: 'usage', usage: { inputTokens: 120, outputTokens: 64, reasoningTokens: 55 } }
+        yield { type: 'finish', reason: { kind: 'max-tokens' } }
+        return
+      }
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text: 'pong' }
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 2, reasoningTokens: 0 } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     },
   }
 }
 const calls = []
 let holdGate = null
+let truncateNext = false
+let declaredEfforts = false
+let throwWith = ''
 
 const moduleUrl = pathToFileURL(path.join(PACKAGE, 'index.js')).href
 const host = await import(moduleUrl)
@@ -571,6 +612,167 @@ const modelTestBad = await call('model-test', 'POST', { provider: '', model: '' 
 check('model-test: empty selection -> 422', modelTestBad.status === 422)
 
 // Spend guard: a local process must not be able to ask the host for an
+// The panel asks which reasoning efforts a model declares: the catalog never
+// carries them, only resolveModelInfo does, and it is allowed to say nothing.
+const infoQuiet = await call('model-info?provider=fake-provider&model=fake-model')
+check(
+  'model-info: a model that declares no efforts says so instead of inventing some',
+  infoQuiet.status === 200 &&
+    Array.isArray(infoQuiet.body.data?.efforts) &&
+    infoQuiet.body.data.efforts.length === 0 &&
+    String(infoQuiet.body.data.error).length > 0,
+  JSON.stringify(infoQuiet.body).slice(0, 220),
+)
+declaredEfforts = true
+const infoLoud = await call('model-info?provider=fake-provider&model=fake-model')
+check(
+  'model-info: declared efforts arrive with their default and descriptions',
+  infoLoud.status === 200 &&
+    infoLoud.body.data?.efforts?.length === 2 &&
+    infoLoud.body.data.efforts[1].description === 'more thinking' &&
+    String(infoLoud.body.data.defaultEffort) === 'low',
+  JSON.stringify(infoLoud.body.data ?? {}).slice(0, 240),
+)
+const infoNoArg = await call('model-info')
+check('model-info: a missing provider is refused, not guessed', infoNoArg.status === 422, String(infoNoArg.status))
+declaredEfforts = false
+
+const withEffort = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello', reasoningEffort: ' high ' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: reasoningEffort reaches the llm seam, trimmed',
+  withEffort.status === 200 && calls[calls.length - 1]?.reasoningEffort === 'high',
+  JSON.stringify(calls[calls.length - 1] ?? {}).slice(0, 200),
+)
+const withoutEffort = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: no effort means the key is absent, so the model keeps its own default',
+  withoutEffort.status === 200 && calls[calls.length - 1] !== undefined && !('reasoningEffort' in calls[calls.length - 1]),
+  JSON.stringify(Object.keys(calls[calls.length - 1] ?? {})),
+)
+const badEffort = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello', reasoningEffort: 'very high!' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a malformed effort id is refused before the model is billed',
+  badEffort.status === 422 && badEffort.body.code === 'bad-request',
+  JSON.stringify(badEffort.body).slice(0, 200),
+)
+
+// An effort the model does not declare is a configuration error: asking again
+// gets the same refusal, so the relay must not bill for it.
+declaredEfforts = true
+const billedBefore = calls.length
+const undeclared = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello', reasoningEffort: 'medium' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: an effort the model does not declare is refused with 422',
+  undeclared.status === 422 && undeclared.body.code === 'unknown-effort',
+  JSON.stringify(undeclared.body).slice(0, 220),
+)
+check(
+  'relay: a refused effort never reaches the model',
+  calls.length === billedBefore,
+  `calls ${billedBefore} -> ${calls.length}`,
+)
+// A model that declares nothing is not evidence that the effort is wrong:
+// let the provider be the one to answer.
+declaredEfforts = false
+const undeclaredModel = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello', reasoningEffort: 'medium' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a model that declares no efforts is still asked',
+  undeclaredModel.status === 200,
+  JSON.stringify(undeclaredModel.body).slice(0, 200),
+)
+
+// A provider that refuses the effort mid-flight says so in its own words.
+throwWith = 'provider "fake-provider" model "fake-model" does not support reasoning effort "medium"'
+const refusedByProvider = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello', reasoningEffort: 'medium' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a provider that refuses the effort is a 422, not a broken stream',
+  refusedByProvider.status === 422 && refusedByProvider.body.code === 'unknown-effort',
+  JSON.stringify(refusedByProvider.body).slice(0, 220),
+)
+
+// An upstream quota needs minutes, not the two-second retry a generic error
+// gets, so it must not arrive as an ordinary 502.
+throwWith = '429 {"type":"error","error":{"type":"rate_limit_error","message":"quota used up"}}'
+const throttledUpstream = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: an upstream rate limit is a 429 the engine backs off from',
+  throttledUpstream.status === 429 && throttledUpstream.body.code === 'rate-limited',
+  JSON.stringify(throttledUpstream.body).slice(0, 220),
+)
+
+// The failure this release exists for: the model stops at max-tokens. The
+// answer still holds the blocks that landed, so it must come back as data.
+truncateNext = true
+const cut = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'translate', maxTokens: 64 },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a max-tokens stop returns 200 with truncated=true, not a 502',
+  cut.status === 200 && cut.body.ok === true && cut.body.truncated === true,
+  JSON.stringify(cut.body).slice(0, 200),
+)
+check(
+  'relay: the cut-off text is still delivered (the engine salvages it)',
+  /你好/.test(String(cut.body.data?.text ?? '')),
+  String(cut.body.data?.text ?? '').slice(0, 80),
+)
+check(
+  'relay: the reply says how much of the budget went to reasoning',
+  Number(cut.body.data?.usage?.reasoningTokens) === 55 &&
+    String(cut.body.data?.finish).includes('max-tokens'),
+  JSON.stringify(cut.body.data?.usage ?? {}),
+)
+truncateNext = false
+const afterCut = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a healthy answer is not marked truncated',
+  afterCut.status === 200 && afterCut.body.truncated !== true && afterCut.body.data?.usage?.outputTokens === 2,
+  JSON.stringify(afterCut.body.data ?? {}).slice(0, 200),
+)
+
 // unbounded completion, or to use the relay as an unlimited credit faucet.
 const oversized = await call(
   'llm',
@@ -886,6 +1088,139 @@ check(
   check('model-test: the DSH branch still requires a provider',
     noProvider.status === 422 && String(noProvider.body.error ?? '').includes('provider'),
     `${noProvider.status} ${noProvider.body.error}`)
+}
+
+// ============================================================================
+// v1.6（REQ-46 / REQ-47c / REQ-59 / REQ-60）：
+//   - 两个新配置键的校验与往返
+//   - 一键补依赖：describe 说明哪些项可以点、路由必须有 confirm、
+//     命令只能来自固定表（这里用 SUBTITLE_STUDIO_FIX_PATH 放假 brew，绝不真装）
+// ============================================================================
+{
+  const fixDescribe = await call('describe')
+  const fixDeps = fixDescribe.body.data?.fixDeps ?? null
+  check('fix-deps: describe names which checks the panel may install',
+    fixDeps !== null && fixDeps.byCheck?.['ffmpeg.filters'] === 'brew-ffmpeg-full' &&
+      fixDeps.byCheck?.ffmpeg === 'brew-ffmpeg-full' && fixDeps.byCheck?.whisper === 'pip-mlx-whisper',
+    JSON.stringify(fixDeps?.byCheck ?? {}).slice(0, 200))
+  check('fix-deps: the label is the whole command, so the panel can show what runs',
+    String(fixDeps?.labels?.['brew-ffmpeg-full'] ?? '') === 'brew install ffmpeg-full',
+    String(fixDeps?.labels?.['brew-ffmpeg-full'] ?? ''))
+  check('fix-deps: a model weight gets no button (multi-GB, the user decides)',
+    fixDeps !== null && !('whisper.model' in (fixDeps.byCheck ?? {})),
+    Object.keys(fixDeps?.byCheck ?? {}).join(','))
+
+  const fasterDraft = structuredClone(fixDescribe.body.data.config)
+  fasterDraft.transcribe.engine = 'faster'
+  await call('save', 'POST', { config: fasterDraft })
+  const fasterDescribe = await call('describe')
+  check('fix-deps: the whisper button follows the transcription engine actually chosen',
+    fasterDescribe.body.data?.fixDeps?.byCheck?.whisper === 'pip-faster-whisper',
+    String(fasterDescribe.body.data?.fixDeps?.byCheck?.whisper))
+  const backDraft = structuredClone(fasterDescribe.body.data.config)
+  backDraft.transcribe.engine = 'mlx'
+  await call('save', 'POST', { config: backDraft })
+
+  const noConfirm = await call('fix-dep', 'POST', { action: 'brew-ffmpeg-full' })
+  check('fix-dep: nothing runs without an explicit confirm',
+    noConfirm.status === 422 && noConfirm.body.code === 'confirm-required',
+    `${noConfirm.status} ${noConfirm.body.code}`)
+
+  const emptyAction = await call('fix-dep', 'POST', { confirm: true })
+  check('fix-dep: an empty action is refused', emptyAction.status === 422, String(emptyAction.status))
+
+  const injected = await call('fix-dep', 'POST', { confirm: true, action: 'rm -rf /', command: 'echo pwned' })
+  check('fix-dep: a command the caller invents is not on the table',
+    injected.status === 422 && injected.body.code === 'unknown-action',
+    `${injected.status} ${injected.body.code}`)
+  check('fix-dep: a rejected action does not even trigger a self-check',
+    injected.body.data === undefined, JSON.stringify(injected.body).slice(0, 120))
+
+  const fakeBin = path.join(SANDBOX, 'fix-bin')
+  const installLog = path.join(SANDBOX, 'fix-argv.txt')
+  fs.mkdirSync(fakeBin, { recursive: true })
+  fs.writeFileSync(
+    path.join(fakeBin, 'brew'),
+    `#!/bin/sh\necho "$@" >> '${installLog}'\necho "fake brew ok"\necho "installed into $HOME/Library/Python/3.9/lib"\n`,
+    { mode: 0o755 },
+  )
+  process.env.SUBTITLE_STUDIO_FIX_PATH = fakeBin
+  const installed = await call('fix-dep', 'POST', { confirm: true, action: 'brew-ffmpeg-full' })
+  delete process.env.SUBTITLE_STUDIO_FIX_PATH
+  const argvSeen = fs.existsSync(installLog) ? fs.readFileSync(installLog, 'utf8').trim() : ''
+  check('fix-dep: a listed action runs exactly the fixed argv',
+    installed.status === 200 && installed.body.ok === true && argvSeen === 'install ffmpeg-full',
+    `${installed.status} argv="${argvSeen}"`)
+  check('fix-dep: the reply carries the command output so the panel can show it',
+    String(installed.body.data?.stdout ?? '').includes('fake brew ok'),
+    String(installed.body.data?.stdout ?? '').slice(0, 60))
+  check('fix-dep: the self-check is re-run right after the install',
+    installed.body.data?.selfcheck !== null && installed.body.data?.selfcheck !== undefined,
+    JSON.stringify(installed.body.data?.selfcheck ?? null).slice(0, 80))
+  check('fix-dep: the reply reports how long it took',
+    typeof installed.body.data?.durationMs === 'number',
+    String(installed.body.data?.durationMs))
+
+  const homeOut = String(installed.body.data?.stdout ?? '')
+  check('fix-dep: absolute home paths are folded to ~ before the panel sees them',
+    homeOut.includes('~/Library/Python/3.9/lib') && !homeOut.includes(String(process.env.HOME ?? '\u0000')),
+    homeOut.slice(0, 120))
+
+  const hostLog = path.join(DATA, 'logs', 'host.log')
+  const logText = fs.existsSync(hostLog) ? fs.readFileSync(hostLog, 'utf8') : ''
+  check('fix-dep: the install is written to the host log',
+    /fix-dep brew-ffmpeg-full: ok in \d+ms/.test(logText),
+    logText.split('\n').filter((line) => line.includes('fix-dep')).slice(-2).join(' | '))
+
+  // 连点两次：第二条必须被挡在门外，而不是让 brew 抢锁报一个看不懂的失败。
+  fs.writeFileSync(
+    path.join(fakeBin, 'brew'),
+    `#!/bin/sh\nsleep 0.8\necho "slow brew ok"\n`,
+    { mode: 0o755 },
+  )
+  process.env.SUBTITLE_STUDIO_FIX_PATH = fakeBin
+  const [firstTap, secondTap] = await Promise.all([
+    call('fix-dep', 'POST', { confirm: true, action: 'brew-ffmpeg-full' }),
+    call('fix-dep', 'POST', { confirm: true, action: 'brew-ffmpeg-full' }),
+  ])
+  delete process.env.SUBTITLE_STUDIO_FIX_PATH
+  const statuses = [firstTap.status, secondTap.status].sort()
+  check('fix-dep: a second install request while one runs is refused, not queued',
+    statuses[0] === 200 && statuses[1] === 409,
+    statuses.join('/'))
+  const refused = [firstTap, secondTap].find((reply) => reply.status === 409)
+  check('fix-dep: the refusal says why', refused?.body?.code === 'already-running',
+    String(refused?.body?.code))
+
+  const badWhen = structuredClone((await call('describe')).body.data.config)
+  badWhen.notify.successWhen = 'always'
+  const rejectedWhen = await call('save', 'POST', { config: badWhen })
+  check('save: notify.successWhen only accepts the two documented modes',
+    rejectedWhen.status === 422 && JSON.stringify(rejectedWhen.body).includes('notify.successWhen'),
+    `${rejectedWhen.status} ${JSON.stringify(rejectedWhen.body).slice(0, 140)}`)
+  const badOwn = structuredClone((await call('describe')).body.data.config)
+  badOwn.selection.skipOwnOutputs = 'nope'
+  const rejectedOwn = await call('save', 'POST', { config: badOwn })
+  check('save: selection.skipOwnOutputs must be a real switch',
+    rejectedOwn.status === 422 && JSON.stringify(rejectedOwn.body).includes('skipOwnOutputs'),
+    `${rejectedOwn.status} ${JSON.stringify(rejectedOwn.body).slice(0, 140)}`)
+
+  const bothDraft = structuredClone((await call('describe')).body.data.config)
+  bothDraft.notify.successWhen = 'anyOutput'
+  bothDraft.selection.skipOwnOutputs = false
+  const savedBoth = await call('save', 'POST', { config: bothDraft })
+  const readBack = await call('describe')
+  check('save: 有产出即成功 + 关掉自家成品判定都能存下来',
+    savedBoth.status === 200 && readBack.body.data?.config?.notify?.successWhen === 'anyOutput' &&
+      readBack.body.data.config.selection.skipOwnOutputs === false,
+    JSON.stringify({
+      when: readBack.body.data?.config?.notify?.successWhen,
+      own: readBack.body.data?.config?.selection?.skipOwnOutputs,
+    }))
+  const restoreDraft = structuredClone(readBack.body.data.config)
+  restoreDraft.notify.successWhen = 'run'
+  restoreDraft.selection.skipOwnOutputs = true
+  await call('save', 'POST', { config: restoreDraft })
 }
 
 // Teardown: the disposer must stop the bridge cleanly.

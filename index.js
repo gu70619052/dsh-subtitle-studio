@@ -133,6 +133,42 @@ const SELECTION_ORDERS = ['name-asc', 'name-desc', 'mtime-asc', 'mtime-desc', 's
 const FFMPEG_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
 const AUDIO_CODECS = ['copy', 'aac', 'opus']
 const NOTIFY_CHANNELS = ['qqbot', 'command', 'webhook', 'none']
+// 什么算「成功」：整轮零失败（旧语义）/ 至少有产出一部（REQ-46）
+const NOTIFY_SUCCESS_WHEN = ['run', 'anyOutput']
+// 能一键补的依赖：面板上每个 error/warn 若命中这里就给一个安装按钮。
+// 值必须是固定的命令模板，不接受面板传入的任何自由文本（见 fix-dep 路由）。
+const FIX_DEP_ACTIONS = {
+  'brew-ffmpeg-full': {
+    label: 'brew install ffmpeg-full',
+    command: 'brew',
+    args: ['install', 'ffmpeg-full'],
+  },
+  'pip-mlx-whisper': {
+    label: 'python3 -m pip install --user mlx-whisper',
+    command: 'python3',
+    args: ['-m', 'pip', 'install', '--user', 'mlx-whisper'],
+  },
+  'pip-faster-whisper': {
+    label: 'python3 -m pip install --user faster-whisper',
+    command: 'python3',
+    args: ['-m', 'pip', 'install', '--user', 'faster-whisper'],
+  },
+  'npm-minimax-mmx': {
+    label: 'npm i -g @minimax/mmx',
+    command: 'npm',
+    args: ['i', '-g', '@minimax/mmx'],
+  },
+}
+// 依赖检查项 → 能一键补它的动作。whisper.model 故意不在表里：模型权重
+// 是几百 MB 到几 GB 的下载，与「装个依赖」不是一回事，单独再议。
+const FIX_DEP_BY_CHECK = {
+  ffmpeg: 'brew-ffmpeg-full',
+  'ffmpeg.filters': 'brew-ffmpeg-full',
+  'ffmpeg.encoder.libx264': 'brew-ffmpeg-full',
+  'ffmpeg.encoder.aac': 'brew-ffmpeg-full',
+  whisper: 'pip-mlx-whisper',
+  'engine.mmx': 'npm-minimax-mmx',
+}
 const SCHEDULE_MODES = ['launchd', 'dsh', 'off']
 const LINK_KINDS = ['local', 'ssh']
 // 输出方式（REQ-42）：压制进视频 / 只生成字幕文件
@@ -159,6 +195,7 @@ const DEFAULT_CONFIG = Object.freeze({
     seed: 42,
     maxTokens: 8000,
     batchSize: 30,
+    reasoningEffort: '',
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: '',
     baseUrl: '',
@@ -191,6 +228,8 @@ const DEFAULT_CONFIG = Object.freeze({
     maxAgeDays: 36500,
     order: 'mtime-asc',
     excludePatterns: ['*.partial', '*.tmp', '*.part'],
+    // 输出目录与来源目录相同时，按命名模板认出自家的成品并排掉（REQ-60）
+    skipOwnOutputs: true,
   },
   prompts: {
     default: {
@@ -244,6 +283,8 @@ const DEFAULT_CONFIG = Object.freeze({
     onStart: false,
     onSuccess: true,
     onFailure: true,
+    // run = 整轮零失败才算成功（旧语义）；anyOutput = 有产出一部就算成功
+    successWhen: 'run',
   },
   // `time` is the primary trigger; `guardTimes` adds extra idempotent guard
   // trigger points (the engine skips a point whose day is already handled).
@@ -265,6 +306,7 @@ const FIELDS = Object.freeze([
   { path: 'engine.seed', kind: 'int', group: 'engine', min: 0, max: 2147483647 },
   { path: 'engine.maxTokens', kind: 'int', group: 'engine', min: 1, max: 2000000 },
   { path: 'engine.batchSize', kind: 'int', group: 'engine', min: 1, max: 10000 },
+  { path: 'engine.reasoningEffort', kind: 'string', group: 'engine', maxLength: 40 },
   { path: 'engine.ollamaHost', kind: 'string', group: 'engine', url: true },
   { path: 'engine.baseUrl', kind: 'string', group: 'engine', url: true },
   { path: 'engine.apiKeyRef', kind: 'string', group: 'engine', secretRef: true, maxLength: 128 },
@@ -297,6 +339,7 @@ const FIELDS = Object.freeze([
   { path: 'selection.maxAgeDays', kind: 'int', group: 'selection', min: 0, max: 100000 },
   { path: 'selection.order', kind: 'enum', options: SELECTION_ORDERS, group: 'selection' },
   { path: 'selection.excludePatterns', kind: 'list', group: 'selection' },
+  { path: 'selection.skipOwnOutputs', kind: 'bool', group: 'selection' },
 
   { path: 'prompts.default.system', kind: 'text', group: 'prompts', maxLength: 8000 },
   { path: 'prompts.default.context', kind: 'text', group: 'prompts', maxLength: 8000 },
@@ -335,6 +378,7 @@ const FIELDS = Object.freeze([
   { path: 'notify.webhookUrl', kind: 'string', group: 'quality', url: true, maxLength: 2048 },
   { path: 'notify.webhookBody', kind: 'string', group: 'quality', maxLength: 4096 },
   { path: 'notify.qqSendPath', kind: 'string', group: 'quality', maxLength: 2048 },
+  { path: 'notify.successWhen', kind: 'enum', options: NOTIFY_SUCCESS_WHEN, group: 'quality' },
   { path: 'notify.onStart', kind: 'bool', group: 'quality' },
   { path: 'notify.onSuccess', kind: 'bool', group: 'quality' },
   { path: 'notify.onFailure', kind: 'bool', group: 'quality' },
@@ -975,6 +1019,14 @@ function validateSubmitted(submitted) {
   if (engine.kind === 'deepseek' && !isHttpUrl(engine.baseUrl)) {
     error('engine.baseUrl', 'is required for the deepseek engine')
   }
+  // An effort id is handed to the model adapter verbatim, so it is an
+  // identifier, not free text. Which ids are legal is per-model and can only be
+  // asked of the host (the `model-info` route), so this rejects only the shapes
+  // that are certainly wrong.
+  const effort = String(engine.reasoningEffort ?? '').trim()
+  if (effort !== '' && !/^[A-Za-z0-9._-]{1,40}$/.test(effort)) {
+    error('engine.reasoningEffort', 'must be a plain identifier such as low / medium / high, or empty to follow the model default')
+  }
   if (toStringList(getAt(submitted, 'source.include')).length === 0) {
     error('source.include', 'must contain at least one pattern, e.g. *.mp4')
   }
@@ -1279,6 +1331,69 @@ function bridgeToken() {
  * @param {string} value - candidate base URL.
  * @returns {boolean}
  */
+/**
+ * What a model says it can do, remembered briefly. The relay needs it to reject
+ * a reasoning effort the provider will refuse, instead of paying for a stream
+ * that dies on the first token; a live check costs one metadata call per model
+ * per minute, not per batch.
+ * @type {Map<string, {at:number, efforts:string[], error:string}>}
+ */
+const EFFORT_CACHE = new Map()
+/** How long a model's declared efforts stay fresh. Zero turns the cache off. */
+const effortCacheMs = () => {
+  const value = Number(process.env.SUBTITLE_STUDIO_EFFORT_CACHE_MS)
+  return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 60_000
+}
+
+/**
+ * @param {object} ctx - the plugin context.
+ * @param {string} provider
+ * @param {string} model
+ * @returns {Promise<{efforts:string[], error:string}>} declared effort ids, and
+ *   why there are none. An empty list means "nothing declared", not "no".
+ */
+async function declaredEfforts(ctx, provider, model) {
+  const key = `${provider}\u0000${model}`
+  const ttl = effortCacheMs()
+  const hit = EFFORT_CACHE.get(key)
+  if (ttl > 0 && hit && Date.now() - hit.at < ttl) return hit
+  let entry = { at: Date.now(), efforts: [], error: '' }
+  try {
+    const llm = ctx.get('llm')
+    if (typeof llm?.resolveModelInfo !== 'function') {
+      entry = { ...entry, error: 'DSH does not expose model capabilities' }
+    } else {
+      const info = await llm.resolveModelInfo(provider, model)
+      entry = {
+        at: Date.now(),
+        efforts: (info?.reasoning?.efforts ?? []).map((row) => String(row?.id ?? '')).filter((id) => id !== ''),
+        error: '',
+      }
+    }
+  } catch (error) {
+    // Unknown model or an unreachable catalogue: do not block the call on it.
+    entry = { at: Date.now(), efforts: [], error: String(error?.message ?? error) }
+  }
+  if (EFFORT_CACHE.size > 64) EFFORT_CACHE.clear()
+  if (ttl > 0) EFFORT_CACHE.set(key, entry)
+  return entry
+}
+
+/**
+ * The message a refused effort comes back with, phrased as what to do instead.
+ * @param {string} provider
+ * @param {string} model
+ * @param {string} effort
+ * @param {string[]} known declared effort ids, possibly empty
+ * @returns {string}
+ */
+function unknownEffortMessage(provider, model, effort, known) {
+  const list = known.length > 0
+    ? `this model declares ${known.join(', ')}`
+    : 'this model declares no reasoning efforts'
+  return `reasoning effort "${effort}" is not valid for ${provider}/${model}: ${list}. Leave it empty to follow the model default.`
+}
+
 function isLoopbackBaseUrl(value) {
   try {
     const url = new URL(String(value ?? ''))
@@ -1430,8 +1545,8 @@ function clampTemperature(value, fallback) {
  * The provider route and its credentials belong to DSH; this plugin never sees
  * an API key.
  * @param {object} ctx - host context.
- * @param {{provider:string, model:string, prompt:string, system?:string, temperature?:number, maxTokens?:number}} input - the call.
- * @returns {Promise<{ok:boolean, text:string, finish:string|null, error:string|null}>}
+ * @param {{provider:string, model:string, prompt:string, system?:string, temperature?:number, maxTokens?:number, reasoningEffort?:string}} input - the call.
+ * @returns {Promise<{ok:boolean, text:string, finish:string|null, usage:object, code:string|null, error:string|null}>}
  */
 async function callLlm(ctx, input) {
   let llm
@@ -1459,9 +1574,17 @@ async function callLlm(ctx, input) {
   }
   if (Number.isFinite(input.temperature)) options.temperature = input.temperature
   if (Number.isFinite(input.maxTokens) && input.maxTokens > 0) options.maxTokens = input.maxTokens
+  // Thinking budget is a model capability, not a plugin invention: the host
+  // learns the legal effort ids from llm.resolveModelInfo and either forwards
+  // the user's pick or omits the key entirely. Omitting it is how DSH itself
+  // spells "follow whatever this provider defaults to".
+  const effort = typeof input.reasoningEffort === 'string' ? input.reasoningEffort.trim() : ''
+  if (effort !== '') options.reasoningEffort = effort
   let text = ''
   let finish = null
   let failure = null
+  let usage = {}
+  let reasoningChars = 0
   // A provider that hangs would otherwise keep this stream — and the engine
   // waiting on it — open forever.
   const controller = new AbortController()
@@ -1470,7 +1593,18 @@ async function callLlm(ctx, input) {
   try {
     for await (const chunk of llm.stream(options)) {
       if (chunk?.type === 'text-delta') text += String(chunk.text ?? '')
-      else if (chunk?.type === 'finish') {
+      else if (chunk?.type === 'reasoning-delta') {
+        // Counted, never returned: it is the clearest signal that a model is
+        // spending the answer budget on thinking, which is what truncates a
+        // translation batch. The panel shows the number, not the reasoning.
+        reasoningChars += String(chunk.text ?? '').length
+      } else if (chunk?.type === 'usage') {
+        usage = {
+          inputTokens: Number(chunk.usage?.inputTokens ?? 0),
+          outputTokens: Number(chunk.usage?.outputTokens ?? 0),
+          reasoningTokens: Number(chunk.usage?.reasoningTokens ?? 0),
+        }
+      } else if (chunk?.type === 'finish') {
         finish = String(chunk.reason?.kind ?? 'unknown')
         if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
           failure = String(chunk.reason?.failure?.message ?? chunk.reason.kind)
@@ -1479,20 +1613,45 @@ async function callLlm(ctx, input) {
     }
   } catch (error) {
     const aborted = error?.name === 'AbortError' || controller.signal.aborted === true
-    return { ok: false, text, finish, error: aborted ? `no answer within ${LLM_CALL_TIMEOUT_MS / 1000}s` : String(error?.message ?? error) }
+    const message = aborted ? `no answer within ${LLM_CALL_TIMEOUT_MS / 1000}s` : String(error?.message ?? error)
+    // Upstream throttling arrives wrapped in whatever the adapter threw. A
+    // rate limit is retryable but needs minutes, not the two-second retry a
+    // generic stream error gets, so name it before it is flattened away.
+    const throttled = !aborted
+      && /\b429\b|rate[_ -]?limit|too many requests|insufficient quota|usage ceiling/i.test(message)
+    // The provider saying "this model has no such effort" is a configuration
+    // answer, not a broken stream: asking again with the same effort gets the
+    // same refusal, so name it instead of letting the caller retry it.
+    const refused = !aborted
+      && /does not support reasoning effort|unknown reasoning effort|unsupported reasoning/i.test(message)
+    return {
+      ok: false, text, finish, usage,
+      code: aborted ? 'timeout' : refused ? 'unknown-effort' : throttled ? 'upstream-rate-limit' : 'stream-error',
+      error: message,
+    }
   } finally {
     clearTimeout(deadline)
   }
-  if (failure !== null) return { ok: false, text, finish, error: failure }
+  if (reasoningChars > 0 && usage.reasoningTokens === undefined) {
+    usage.reasoningChars = reasoningChars
+  }
+  if (failure !== null) return { ok: false, text, finish, usage, code: 'stream-error', error: failure }
   if (finish === 'max-tokens') {
-    return { ok: false, text, finish, error: 'the model stopped at its token limit' }
+    // Truncation is deterministic: asking again with the same prompt and the
+    // same budget burns the same number of tokens for the same cut-off answer.
+    // The text up to the cut is still good, so hand it back with a flag and let
+    // the caller keep what landed instead of retrying.
+    return {
+      ok: false, text, finish, usage, code: 'token-limit',
+      error: 'the model stopped at its token limit',
+    }
   }
   if (finish === null) {
     // The contract guarantees a terminal finish chunk; without one there is no
     // way to know the text is complete, so treat it as a failure.
-    return { ok: false, text, finish, error: 'the model stream ended without a finish signal' }
+    return { ok: false, text, finish, usage, code: 'no-finish', error: 'the model stream ended without a finish signal' }
   }
-  return { ok: true, text, finish, error: null }
+  return { ok: true, text, finish, usage, code: null, error: null }
 }
 
 /**
@@ -2639,6 +2798,9 @@ async function describe(ctx) {
     })(),
     scheduleModes: SCHEDULE_MODES,
     linkKinds: LINK_KINDS,
+    // REQ-47(c)：面板据此给「缺失依赖」那一行画安装按钮。只暴露动作 id 与
+    // 人类可读的命令文本，命令本体留在宿主，面板永远不传命令。
+    fixDeps: fixDepInfo(config),
     models,
     bridge: {
       endpointPath: BRIDGE_ENDPOINT_PATH,
@@ -2660,6 +2822,100 @@ async function describe(ctx) {
     },
     logs: listLogFiles(),
     platform: process.platform,
+  }
+}
+
+/* ------------------------------- dependency fix ---------------------------- */
+
+/**
+ * Which missing dependencies the panel may offer to install, and the exact text
+ * of the command. The mapping is built here, not in the panel: the browser only
+ * ever sends an action id, and an unknown id is refused.
+ *
+ * Deliberately absent: whisper.model. A model weight is a multi-GB download and
+ * a much bigger commitment than `brew install`; it stays a documented manual
+ * step rather than one click.
+ */
+function fixDepInfo(config) {
+  const transcribeEngine = String(config?.transcribe?.engine ?? 'mlx')
+  const byCheck = { ...FIX_DEP_BY_CHECK }
+  // mlx-whisper 只有 Apple Silicon 的 wheel；Intel 上即使配置写着 mlx，
+  // 推荐的也必须是 faster-whisper，否则按钮点下去必然装失败。
+  const appleSilicon = process.arch === 'arm64'
+  if (transcribeEngine === 'faster' || !appleSilicon) byCheck.whisper = 'pip-faster-whisper'
+  const labels = {}
+  for (const [id, action] of Object.entries(FIX_DEP_ACTIONS)) labels[id] = action.label
+  return { byCheck, labels }
+}
+
+/**
+ * Run one whitelisted install command and then re-run the dependency check.
+ *
+ * Safety rails, in order of importance:
+ *  - only an id from FIX_DEP_ACTIONS is accepted; the panel cannot name a command
+ *  - no bridge token here, deliberately: that token never reaches the browser
+ *    (handing it over would 401 the panel), so what fences this route is the
+ *    same-origin/Host check in `route()` plus the fixed action table
+ *  - `confirm: true` must be present, so an accidental POST installs nothing
+ *  - one install at a time: a second concurrent request is refused, because
+ *    two brew runs fight over the same lock and report one bogus failure
+ *  - nothing in the scheduled path can reach this: launchd runs
+ *    `subtitle-run run`, which never calls a host route
+ */
+// Install output quotes absolute paths (`/Users/<name>/Library/Python/...`).
+// The panel is local, but the same text ends up in screenshots and bug reports,
+// so the home prefix is folded to `~` before it ever leaves the host.
+function scrubHomePaths(text) {
+  const raw = String(text ?? '')
+  if (raw === '') return ''
+  const home = String(process.env.HOME ?? '').trim()
+  const folded = home === '' ? raw : raw.split(home).join('~')
+  return folded.slice(-8000)
+}
+
+let fixDepInFlight = false
+
+async function runFixDep(ctx, actionId) {
+  const action = FIX_DEP_ACTIONS[actionId]
+  if (action === undefined) {
+    return { ok: false, code: 'unknown-action', error: `unknown action: ${actionId}` }
+  }
+  // launchd 起的子进程没有 /opt/homebrew/bin，brew 会「找不到命令」。
+  // SUBTITLE_STUDIO_FIX_PATH 与 SUBTITLE_STUDIO_ENGINE 同一套路：包管理器装在
+  // 非常见位置时由用户指路，命令与参数仍是上面那张常量表里的，改不了。
+  const path = [
+    String(process.env.SUBTITLE_STUDIO_FIX_PATH ?? '').trim(),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    ...String(process.env.PATH ?? '').split(':').filter((part) => part !== ''),
+  ].filter((part) => part !== '').join(':')
+  const started = Date.now()
+  try {
+    const { stdout, stderr } = await execFileAsync(action.command, action.args, {
+      env: { ...process.env, PATH: path, HOMEBREW_NO_AUTO_UPDATE: '1' },
+      timeout: 15 * 60 * 1000,
+      maxBuffer: 4 * 1024 * 1024,
+      // 不设 shell：argv 是常量数组，用户输入进不来。
+    })
+    return {
+      ok: true,
+      action: actionId,
+      command: action.label,
+      durationMs: Date.now() - started,
+      stdout: scrubHomePaths(stdout),
+      stderr: scrubHomePaths(stderr),
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      action: actionId,
+      command: action.label,
+      code: error?.code === 'ENOENT' ? 'command-missing' : 'install-failed',
+      error: String(error?.message ?? error),
+      durationMs: Date.now() - started,
+      stdout: scrubHomePaths(error?.stdout),
+      stderr: scrubHomePaths(error?.stderr),
+    }
   }
 }
 
@@ -3005,6 +3261,30 @@ function makeRoutes(ctx) {
         writeJson(response, 422, { ok: false, error: 'provider, model and prompt are required', code: 'bad-request' })
         return true
       }
+      const effort = String(body?.reasoningEffort ?? '').trim()
+      // An effort id is an opaque identifier, never free text: rejecting a
+      // malformed one here beats forwarding it to the adapter on every batch.
+      if (effort !== '' && !/^[A-Za-z0-9._-]{1,40}$/.test(effort)) {
+        releaseSlot()
+        writeJson(response, 422, { ok: false, error: 'reasoningEffort must be a plain identifier', code: 'bad-request' })
+        return true
+      }
+      // A refused effort is deterministic, so find out before paying for a
+      // stream that dies at the first token. Only enforce this when DSH
+      // actually answered for the model: an unknown model is not evidence
+      // that the effort itself is wrong.
+      if (effort !== '') {
+        const declared = await declaredEfforts(ctx, provider, model)
+        if (declared.error === '' && declared.efforts.length > 0 && !declared.efforts.includes(effort)) {
+          releaseSlot()
+          writeJson(response, 422, {
+            ok: false,
+            error: unknownEffortMessage(provider, model, effort, declared.efforts),
+            code: 'unknown-effort',
+          })
+          return true
+        }
+      }
       let result
       try {
         result = await callLlm(ctx, {
@@ -3014,16 +3294,44 @@ function makeRoutes(ctx) {
         system: typeof body?.system === 'string' ? body.system : '',
         temperature: clampTemperature(body?.temperature, undefined),
           maxTokens: clampTokens(body?.maxTokens, relayMaxTokens(), relayMaxTokens()),
+          reasoningEffort: effort,
         })
       } finally {
         // A throwing stream must not leak the slot and wedge the relay.
         releaseSlot()
       }
       if (result.ok !== true) {
-        writeJson(response, 502, { ok: false, error: result.error ?? 'llm call failed', code: 'llm-failed' })
+        if (result.code === 'token-limit') {
+          // A cut-off answer still contains the blocks that did land. Returning
+          // it as a success with `truncated` lets the engine keep those and
+          // re-ask only for the tail; a 502 would throw the whole batch away.
+          writeJson(response, 200, {
+            ok: true,
+            truncated: true,
+            data: { text: result.text, finish: result.finish, usage: result.usage ?? {} },
+          })
+          return true
+        }
+        if (result.code === 'unknown-effort') {
+          // The provider refused the effort: asking again with the same effort
+          // gets the same refusal, so answer with a configuration error.
+          writeJson(response, 422, { ok: false, error: result.error, code: 'unknown-effort' })
+          return true
+        }
+        if (result.code === 'upstream-rate-limit') {
+          // The provider itself said "slow down". Back off like it means it.
+          writeJson(response, 429, { ok: false, error: result.error, code: 'rate-limited' })
+          return true
+        }
+        const status = result.code === 'timeout' ? 504 : 502
+        writeJson(response, status, {
+          ok: false,
+          error: result.error ?? 'llm call failed',
+          code: result.code ?? 'llm-failed',
+        })
         return true
       }
-      writeJson(response, 200, { ok: true, data: { text: result.text, finish: result.finish } })
+      writeJson(response, 200, { ok: true, data: { text: result.text, finish: result.finish, usage: result.usage ?? {} } })
       return true
     }),
 
@@ -3080,6 +3388,18 @@ function makeRoutes(ctx) {
         writeJson(response, 422, { ok: false, error: 'provider is required for the DSH relay', code: 'bad-request' })
         return true
       }
+      const testEffort = String(body?.reasoningEffort ?? currentConfig().engine?.reasoningEffort ?? '').trim()
+      if (testEffort !== '' && /^[A-Za-z0-9._-]{1,40}$/.test(testEffort)) {
+        const declared = await declaredEfforts(ctx, provider, model)
+        if (declared.error === '' && declared.efforts.length > 0 && !declared.efforts.includes(testEffort)) {
+          writeJson(response, 200, {
+            ok: false,
+            warning: 'unknown-effort',
+            error: unknownEffortMessage(provider, model, testEffort, declared.efforts),
+          })
+          return true
+        }
+      }
       const result = await callLlm(ctx, {
         provider,
         model,
@@ -3087,12 +3407,88 @@ function makeRoutes(ctx) {
         system: typeof body?.system === 'string' ? body.system.slice(0, 8000) : '',
         temperature: 0,
         maxTokens: clampTokens(body?.maxTokens, 32, 256),
+        reasoningEffort: /^[A-Za-z0-9._-]{1,40}$/.test(testEffort) ? testEffort : '',
       })
       if (result.ok !== true) {
-        writeJson(response, 502, { ok: false, error: result.error ?? 'llm call failed', code: 'llm-failed' })
+        // A refused effort is a configuration answer: the panel shows it as a
+        // warning, because the model itself is fine.
+        if (result.code === 'unknown-effort') {
+          writeJson(response, 200, {
+            ok: false,
+            warning: 'unknown-effort',
+            error: result.error ?? 'this model does not support that reasoning effort',
+          })
+          return true
+        }
+        // A truncated answer is still an answer: say so, because the panel uses
+        // this button as the pre-flight for a real run.
+        if (result.code === 'token-limit') {
+          writeJson(response, 200, {
+            ok: true,
+            data: {
+              text: result.text === ''
+                ? '有响应预算全花在思考上，正文被截断（换非思考模型、调低思考档位，或加大最大 token）'
+                : result.text,
+              finish: 'max-tokens',
+              usage: result.usage ?? {},
+              warning: 'token-limit',
+            },
+          })
+          return true
+        }
+        writeJson(response, 502, { ok: false, error: result.error ?? 'llm call failed', code: result.code ?? 'llm-failed' })
         return true
       }
-      writeJson(response, 200, { ok: true, data: { text: result.text, finish: result.finish } })
+      writeJson(response, 200, { ok: true, data: { text: result.text, finish: result.finish, usage: result.usage ?? {} } })
+      return true
+    }),
+
+    // What can this model actually be told? Effort ids are model metadata, so
+    // the panel asks instead of guessing. Failure is a 200 with an explanation:
+    // this is a probe, and "no declared thinking levels" is a normal answer.
+    exact('model-info', 'GET', async (request, response) => {
+      const provider = String(queryOf(request, 'provider') ?? '').trim()
+      const model = String(queryOf(request, 'model') ?? '').trim()
+      if (provider === '' || model === '') {
+        writeJson(response, 422, { ok: false, error: 'provider and model are required', code: 'bad-request' })
+        return true
+      }
+      let llm
+      try {
+        llm = ctx.get('llm')
+      } catch {
+        llm = null
+      }
+      if (llm === undefined || llm === null || typeof llm.resolveModelInfo !== 'function') {
+        writeJson(response, 200, { ok: true, data: { efforts: [], defaultEffort: '', error: 'DSH 未提供模型能力查询' } })
+        return true
+      }
+      try {
+        const info = await llm.resolveModelInfo(provider, model)
+        const efforts = Array.isArray(info?.reasoning?.efforts)
+          ? info.reasoning.efforts
+            .map((entry) => ({
+              id: String(entry?.id ?? ''),
+              name: String(entry?.name ?? entry?.id ?? ''),
+              description: typeof entry?.description === 'string' ? entry.description.slice(0, 200) : '',
+            }))
+            .filter((entry) => entry.id !== '')
+          : []
+        writeJson(response, 200, {
+          ok: true,
+          data: {
+            efforts,
+            defaultEffort: String(info?.reasoning?.defaultEffort ?? ''),
+            defaultMaxTokens: Number.isFinite(info?.defaultMaxTokens) ? info.defaultMaxTokens : 0,
+            error: efforts.length === 0 ? '该模型未声明思考档位（留空即跟随默认）' : '',
+          },
+        })
+      } catch (error) {
+        writeJson(response, 200, {
+          ok: true,
+          data: { efforts: [], defaultEffort: '', error: String(error?.message ?? error).slice(0, 200) },
+        })
+      }
       return true
     }),
 
@@ -3175,6 +3571,72 @@ function makeRoutes(ctx) {
     exact('selfcheck', 'POST', async (request, response) => {
       const result = await runSelfCheck({ force: queryOf(request, 'force') === '1' })
       writeJson(response, result.ok === true ? 200 : 500, { ok: result.ok === true, data: result.data })
+      return true
+    }),
+
+    exact('fix-dep', 'POST', async (request, response) => {
+      // Same fence as every other route (`route()` already rejected cross-site
+      // and rebound hosts). No bridge token here: the token exists to stop the
+      // engine's relay from being read by *another user's* process, and it is
+      // never handed to the browser. What actually protects this route is the
+      // fixed action table (the panel cannot name a command) plus `confirm`,
+      // which no automatic caller sets — and anyone who could forge both is
+      // already able to run `brew` themselves.
+      let body
+      try {
+        body = await readJsonBody(request)
+      } catch (error) {
+        writeJson(response, error?.code === 'payload-too-large' ? 413 : error?.code === 'bad-content-type' ? 415 : 400, { ok: false, error: String(error?.message ?? error), code: 'bad-body' })
+        return true
+      }
+      if (body?.confirm !== true) {
+        writeJson(response, 422, {
+          ok: false,
+          code: 'confirm-required',
+          error: 'installing a dependency changes this machine: send confirm: true once the user has agreed',
+        })
+        return true
+      }
+      const actionId = String(body?.action ?? '').trim()
+      if (actionId === '') {
+        writeJson(response, 422, { ok: false, error: 'action is required', code: 'invalid-action' })
+        return true
+      }
+      if (FIX_DEP_ACTIONS[actionId] === undefined) {
+        // 面板只能从这张表里挑；不在表上就地拒绝，连自检都不跑。
+        writeJson(response, 422, {
+          ok: false,
+          code: 'unknown-action',
+          error: `that action is not in the allowed list: ${actionId.slice(0, 60)}`,
+        })
+        return true
+      }
+      if (fixDepInFlight) {
+        // 两条 brew 会抢同一个锁，第二条只会报一条看不懂的失败。
+        writeJson(response, 409, {
+          ok: false,
+          code: 'already-running',
+          error: 'another install is still running; wait for it to finish',
+        })
+        return true
+      }
+      fixDepInFlight = true
+      let result
+      try {
+        result = await runFixDep(ctx, actionId)
+      } finally {
+        fixDepInFlight = false
+      }
+      appendHostLog(
+        `fix-dep ${actionId}: ${result.ok === true ? 'ok' : `failed (${result.code ?? 'error'})`} in ${result.durationMs ?? 0}ms`,
+      )
+      // 装完立刻重跑一次自检：面板要看到的是「现在到底行不行」，
+      // 而不是六小时前那份缓存。
+      const check = await runSelfCheck({ force: true })
+      writeJson(response, result.ok === true ? 200 : 500, {
+        ok: result.ok === true,
+        data: { ...result, selfcheck: check?.data ?? null },
+      })
       return true
     }),
 
