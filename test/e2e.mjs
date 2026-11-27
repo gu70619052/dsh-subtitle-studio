@@ -779,6 +779,46 @@ check(
   JSON.stringify({ batch: de.batchSize, max: de.maxTokens }),
 )
 
+// REQ-52 (split off from REQ-64): mlx-whisper is Apple Silicon only, so an
+// Intel host must not be handed 'mlx' as its default transcriber.
+const expectedEngine = process.platform === 'darwin' && process.arch === 'arm64' ? 'mlx' : 'faster'
+const servedEngine = defaultsSeen.body?.data?.defaults?.transcribe?.engine
+check(
+  'describe: transcribe default follows the CPU architecture',
+  servedEngine === expectedEngine,
+  JSON.stringify({ served: servedEngine, expected: expectedEngine, arch: process.arch }),
+)
+const hostSrc = fs.readFileSync(path.join(HERE, '..', 'index.js'), 'utf8')
+// CHK-02 / REQ-48: the docs figure must exist, be referenced, and stay a
+// schematic (no real paths, no screenshot bytes).
+{
+  const readme = fs.readFileSync(path.join(HERE, '..', 'README.md'), 'utf8')
+  const svgPath = path.join(HERE, '..', 'docs/preview.svg')
+  const svg = fs.existsSync(svgPath) ? fs.readFileSync(svgPath, 'utf8') : ''
+  check(
+    'README embeds the panel schematic',
+    /!\[[^\]]*\]\(docs\/preview\.svg\)/.test(readme) && svg.length > 500,
+    `svg bytes=${svg.length}`,
+  )
+  check(
+    'the schematic is labelled as a schematic and carries no absolute home path',
+    /schematic, not a screenshot/.test(svg) && /aria-label="[^"]+"/.test(svg)
+      && !/\/Users\/[A-Za-z0-9._-]+/.test(svg),
+  )
+}
+
+check(
+  'host computes the transcribe default instead of hardcoding mlx',
+  /engine:\s*defaultTranscribeEngine\(\)/.test(hostSrc)
+    && /process\.platform === 'darwin' && process\.arch === 'arm64'/.test(hostSrc),
+)
+const engineCfg = fs.readFileSync(path.join(HERE, '..', 'engine/lib/config.py'), 'utf8')
+check(
+  'engine agrees with the host on the architecture split',
+  /platform\.system\(\) == "Darwin" and platform\.machine\(\) == "arm64"/.test(engineCfg)
+    && !/"engine": "mlx",/.test(engineCfg),
+)
+
 // The failure this release exists for: the model stops at max-tokens. The
 // answer still holds the blocks that landed, so it must come back as data.
 truncateNext = true

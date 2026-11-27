@@ -1,58 +1,92 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Subtitle Studio settings panel">
-  <!-- settings window -->
-  <rect x="42" y="20" width="556" height="262" rx="16" fill="none" stroke="#9aa5b8" stroke-width="2"/>
-  <!-- window dots -->
-  <circle cx="64" cy="40" r="3.4" fill="#9aa5b8" opacity="0.5"/>
-  <circle cx="76" cy="40" r="3.4" fill="#9aa5b8" opacity="0.35"/>
-  <circle cx="88" cy="40" r="3.4" fill="#9aa5b8" opacity="0.25"/>
-  <!-- left navigation -->
-  <line x1="176" y1="56" x2="176" y2="268" stroke="#9aa5b8" stroke-width="1.4" opacity="0.35"/>
-  <rect x="58" y="66" width="9" height="9" rx="2.4" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="74" y="68" width="66" height="6" rx="3" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="58" y="94" width="9" height="9" rx="2.4" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="74" y="96" width="52" height="6" rx="3" fill="#9aa5b8" opacity="0.5"/>
-  <!-- selected section: subtitle studio -->
-  <rect x="50" y="112" width="118" height="26" rx="8" fill="#2f6feb" opacity="0.12"/>
-  <rect x="56" y="119" width="9" height="9" rx="2.4" fill="#2f6feb"/>
-  <rect x="72" y="121" width="58" height="6.4" rx="3.2" fill="#2f6feb"/>
-  <rect x="58" y="150" width="9" height="9" rx="2.4" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="74" y="152" width="60" height="6" rx="3" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="58" y="178" width="9" height="9" rx="2.4" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="74" y="180" width="44" height="6" rx="3" fill="#9aa5b8" opacity="0.5"/>
-  <!-- panel heading -->
-  <rect x="196" y="66" width="116" height="9" rx="4.5" fill="#9aa5b8"/>
-  <rect x="196" y="82" width="204" height="6.4" rx="3.2" fill="#9aa5b8" opacity="0.5"/>
-  <!-- eight tabs -->
-  <rect x="196" y="100" width="42" height="18" rx="6" fill="#2f6feb"/>
-  <rect x="242" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="288" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="334" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="380" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="426" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="472" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <rect x="518" y="100" width="42" height="18" rx="6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.6"/>
-  <line x1="196" y1="130" x2="574" y2="130" stroke="#9aa5b8" stroke-width="1.2" opacity="0.3"/>
-  <!-- form rows -->
-  <rect x="196" y="146" width="46" height="7" rx="3.5" fill="#9aa5b8" opacity="0.85"/>
-  <rect x="270" y="139" width="150" height="22" rx="7" fill="none" stroke="#9aa5b8" stroke-width="1.6" opacity="0.7"/>
-  <rect x="280" y="147" width="66" height="6" rx="3" fill="#9aa5b8" opacity="0.55"/>
-  <path d="M400 147l6 6 6-6" fill="none" stroke="#9aa5b8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" opacity="0.7"/>
-  <rect x="196" y="178" width="38" height="7" rx="3.5" fill="#9aa5b8" opacity="0.85"/>
-  <rect x="270" y="171" width="212" height="22" rx="7" fill="none" stroke="#9aa5b8" stroke-width="1.6" opacity="0.7"/>
-  <rect x="280" y="179" width="118" height="6" rx="3" fill="#9aa5b8" opacity="0.4"/>
-  <!-- result table -->
-  <line x1="196" y1="204" x2="574" y2="204" stroke="#9aa5b8" stroke-width="1.2" opacity="0.3"/>
-  <circle cx="203" cy="216" r="3.6" fill="#2f6feb" opacity="0.8"/>
-  <rect x="214" y="213" width="96" height="6" rx="3" fill="#9aa5b8" opacity="0.6"/>
-  <rect x="352" y="213" width="52" height="6" rx="3" fill="#9aa5b8" opacity="0.4"/>
-  <rect x="500" y="213" width="58" height="6" rx="3" fill="#9aa5b8" opacity="0.4"/>
-  <circle cx="203" cy="234" r="3.6" fill="none" stroke="#9aa5b8" stroke-width="1.4" opacity="0.7"/>
-  <rect x="214" y="231" width="78" height="6" rx="3" fill="#9aa5b8" opacity="0.5"/>
-  <rect x="352" y="231" width="64" height="6" rx="3" fill="#9aa5b8" opacity="0.35"/>
-  <rect x="500" y="231" width="44" height="6" rx="3" fill="#9aa5b8" opacity="0.35"/>
-  <!-- footer actions -->
-  <line x1="196" y1="248" x2="574" y2="248" stroke="#9aa5b8" stroke-width="1.2" opacity="0.3"/>
-  <rect x="196" y="258" width="88" height="6" rx="3" fill="#9aa5b8" opacity="0.35"/>
-  <rect x="470" y="255" width="52" height="20" rx="7" fill="none" stroke="#9aa5b8" stroke-width="1.6" opacity="0.7"/>
-  <rect x="530" y="255" width="44" height="20" rx="7" fill="#2f6feb"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="380" viewBox="0 0 680 380" role="img" aria-label="Annotated schematic of the Subtitle Studio settings panel">
+  <!-- Annotated schematic, not a screenshot. Drawn on its own light plate so it
+       reads the same in a light and a dark README theme. -->
+  <rect x="0" y="0" width="680" height="380" rx="14" fill="#f6f7f9"/>
+  <text x="24" y="30" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="13" font-weight="600" fill="#2f3646">Subtitle Studio — settings</text>
+  <text x="24" y="47" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="9.5" fill="#6f7789">local or SSH folders → transcribe → translate → burned bilingual subtitles</text>
+
+  <!-- tab strip: the eight real tabs -->
+  <g font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif" font-size="8.6" fill="#5b6478">
+    <rect x="24" y="58" width="632" height="24" rx="7" fill="#eceef2"/>
+    <text x="34" y="73">Overview</text>
+    <rect x="99" y="61" width="58" height="18" rx="5" fill="#ffffff" stroke="#c9d0dd"/>
+    <text x="115" y="73" fill="#2f3646" font-weight="600">Engine</text>
+    <text x="168" y="73">Sources &amp; Output</text>
+    <text x="268" y="73">Selection</text>
+    <text x="326" y="73">Prompts</text>
+    <text x="382" y="73">Quality &amp; Audio</text>
+    <text x="470" y="73">Schedule</text>
+    <text x="534" y="73">Diagnostics</text>
+  </g>
+
+  <!-- left card: the model picker -->
+  <g>
+    <rect x="24" y="92" width="360" height="176" rx="10" fill="#ffffff" stroke="#ccd3df"/>
+    <text x="40" y="110" font-family="ui-sans-serif, sans-serif" font-size="10" font-weight="600" fill="#2f3646">Model</text>
+    <text x="196" y="110" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#8b93a7">one dropdown: DSH models + Ollama</text>
+
+    <rect x="40" y="118" width="328" height="26" rx="6" fill="#f6f7f9" stroke="#b9c2d2"/>
+    <text x="52" y="135" font-family="ui-sans-serif, sans-serif" font-size="9" fill="#3c4456">DSH · &lt;provider&gt; / &lt;model&gt;</text>
+    <path d="M350 128 l6 6 6 -6" fill="none" stroke="#7d879c" stroke-width="1.4" stroke-linecap="round"/>
+
+    <rect x="40" y="148" width="328" height="48" rx="6" fill="#f9fafc" stroke="#dde2ea"/>
+    <g font-family="ui-sans-serif, sans-serif" font-size="8.2" fill="#6f7789">
+      <text x="52" y="162">DSH models (read from your own DSH configuration)</text>
+      <text x="60" y="175" fill="#4b5464">provider-a · model-a1        provider-b · model-b2</text>
+      <text x="60" y="187" fill="#4b5464">provider-c · model-c1</text>
+    </g>
+    <text x="52" y="209" font-family="ui-sans-serif, sans-serif" font-size="8.2" fill="#8b93a7">— Ollama —  &lt;local GGUF name&gt;</text>
+
+    <rect x="40" y="218" width="160" height="24" rx="6" fill="#eef4ff" stroke="#c3d5f5"/>
+    <text x="52" y="234" font-family="ui-sans-serif, sans-serif" font-size="8.2" fill="#37568c">relay budget · shown for DSH</text>
+    <rect x="208" y="218" width="160" height="24" rx="6" fill="#f2f3f6" stroke="#dde2ea"/>
+    <text x="220" y="234" font-family="ui-sans-serif, sans-serif" font-size="8.2" fill="#6f7789">ollama host · shown for Ollama</text>
+
+    <rect x="40" y="248" width="328" height="16" rx="5" fill="#f9fafc" stroke="#e3e7ee"/>
+    <text x="52" y="259" font-family="ui-sans-serif, sans-serif" font-size="7.8" fill="#8b93a7">▸ Advanced — temperature, seed, reasoning effort, batch, max tokens</text>
+  </g>
+
+  <!-- right column: folder cards -->
+  <g>
+    <rect x="396" y="92" width="260" height="86" rx="10" fill="#ffffff" stroke="#ccd3df"/>
+    <text x="410" y="108" font-family="ui-sans-serif, sans-serif" font-size="9.6" font-weight="600" fill="#2f3646">Source folder</text>
+    <rect x="410" y="114" width="96" height="18" rx="5" fill="#f6f7f9" stroke="#b9c2d2"/>
+    <text x="420" y="127" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#3c4456">local  |  ssh</text>
+    <rect x="512" y="114" width="130" height="18" rx="5" fill="#f6f7f9" stroke="#dde2ea"/>
+    <text x="522" y="127" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#6f7789">/mnt/nas/shows</text>
+    <text x="410" y="150" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#6f7789">host · port · user appear only when set to ssh</text>
+    <text x="410" y="165" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#6f7789">+ add another folder — one run walks every folder</text>
+
+    <rect x="396" y="186" width="260" height="82" rx="10" fill="#ffffff" stroke="#ccd3df"/>
+    <text x="410" y="202" font-family="ui-sans-serif, sans-serif" font-size="9.6" font-weight="600" fill="#2f3646">Output</text>
+    <rect x="410" y="208" width="232" height="18" rx="5" fill="#f6f7f9" stroke="#b9c2d2"/>
+    <text x="420" y="221" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#3c4456">burn video | srt only      ·      {stem}_zh.mp4</text>
+    <text x="410" y="244" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#6f7789">the translated ledger survives a folder or mode change</text>
+    <text x="410" y="258" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#6f7789">finished outputs are never picked back up as sources</text>
+  </g>
+
+  <!-- first-run checklist -->
+  <g>
+    <rect x="24" y="282" width="632" height="62" rx="10" fill="#ffffff" stroke="#ccd3df"/>
+    <text x="40" y="300" font-family="ui-sans-serif, sans-serif" font-size="9.6" font-weight="600" fill="#2f3646">First run</text>
+    <text x="112" y="300" font-family="ui-sans-serif, sans-serif" font-size="8" fill="#8b93a7">shown only while there is no config file yet</text>
+    <g font-family="ui-sans-serif, sans-serif" font-size="8.4" fill="#4b5464">
+      <circle cx="48" cy="318" r="5.5" fill="none" stroke="#3f9d6b" stroke-width="1.4"/>
+      <text x="44.6" y="321" font-size="7" fill="#3f9d6b">✓</text><text x="60" y="321">ffmpeg with ass + subtitles</text>
+      <circle cx="200" cy="318" r="5.5" fill="none" stroke="#3f9d6b" stroke-width="1.4"/>
+      <text x="196.6" y="321" font-size="7" fill="#3f9d6b">✓</text><text x="212" y="321">transcriber installed</text>
+      <circle cx="330" cy="318" r="5.5" fill="none" stroke="#d0863c" stroke-width="1.4"/>
+      <text x="327.2" y="321" font-size="7" fill="#d0863c">!</text><text x="342" y="321">model picked</text>
+      <circle cx="440" cy="318" r="5.5" fill="none" stroke="#b9c2d2" stroke-width="1.4"/>
+      <text x="437.4" y="321" font-size="7" fill="#8b93a7">4</text><text x="452" y="321">folder reachable</text>
+      <circle cx="546" cy="318" r="5.5" fill="none" stroke="#b9c2d2" stroke-width="1.4"/>
+      <text x="543.4" y="321" font-size="7" fill="#8b93a7">5</text><text x="558" y="321">dry run</text>
+      <text x="40" y="337" font-size="8" fill="#6f7789">a blocked step carries one install button; the plugin runs a fixed command table after you confirm, then re-runs the self-check</text>
+    </g>
+  </g>
+
+  <g font-family="ui-sans-serif, sans-serif" font-size="8.2" fill="#8b93a7">
+    <text x="24" y="364">Nothing leaves this machine except the subtitle text you send to the model you chose.</text>
+    <text x="656" y="364" text-anchor="end">schematic, not a screenshot</text>
+  </g>
 </svg>

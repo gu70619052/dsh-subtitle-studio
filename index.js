@@ -176,6 +176,14 @@ const OUTPUT_MODES = ['burn', 'srt']
 // mlx_whisper 只在 Apple Silicon 上跑得起来，所以转写引擎必须是面板可见的选项，
 // 否则 Intel 机器上的用户只能手写 config.json。
 const TRANSCRIBE_ENGINES = ['mlx', 'faster']
+
+// mlx-whisper only runs on Apple Silicon. An Intel Mac (or any other host)
+// has to start on faster-whisper, otherwise the very first run fails with an
+// import error the user cannot act on. Decided once at load; the panel can
+// still override it, and the self-check offers the matching pip install.
+function defaultTranscribeEngine() {
+  return process.platform === 'darwin' && process.arch === 'arm64' ? 'mlx' : 'faster'
+}
 // 字幕样式模板（REQ-27），与 engine/lib/style_templates.py 的预设一一对应
 const STYLE_TEMPLATE_IDS = ['default', 'bold-yellow', 'top-white', 'boxed', 'cinema']
 
@@ -258,7 +266,7 @@ const DEFAULT_CONFIG = Object.freeze({
     fontSize: 0,
   },
   transcribe: {
-    engine: 'mlx',
+    engine: defaultTranscribeEngine(),
     whisperModel: '',
     language: '',
     keepAudio: false,

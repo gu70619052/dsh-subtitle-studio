@@ -1060,6 +1060,31 @@ def case_defaults_recalibrated():
           "h.engine.maxTokens" in client and "h.engine.batchSize" in client, "")
 
 
+def case_transcribe_default_follows_arch():
+    """引擎默认转写引擎必须按 CPU 走，且与宿主同一口径。"""
+    import platform
+    expected = "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster"
+    served = config_mod.DEFAULTS["transcribe"]["engine"]
+    check("引擎默认转写引擎按架构选", served == expected,
+          "%s != %s" % (served, expected))
+    check("两个引擎名都在枚举里", served in ("mlx", "faster"), repr(served))
+    src = io.open(os.path.join(HERE, "..", "engine/lib/config.py"), encoding="utf-8").read()
+    check("引擎默认值不是写死的 mlx", '"engine": "mlx",' not in src, "")
+    check("引擎与宿主读同一份枚举",
+          "platform.system() == \"Darwin\" and platform.machine() == \"arm64\"" in src, "")
+    host = io.open(os.path.join(HERE, "..", "index.js"), encoding="utf-8").read()
+    check("宿主同样按 platform+arch 分流",
+          "process.platform === 'darwin' && process.arch === 'arm64'" in host
+              and "engine: defaultTranscribeEngine()," in host, "")
+    # 校验器不能再对着默认值报错（否则 Intel 首装即红）
+    data = json.loads(json.dumps(config_mod.DEFAULTS))
+    data["source"]["path"] = "/src"
+    data["output"]["path"] = "/out"
+    errors = [i for i in config_mod.validate(data)
+              if i.get("level") == "error" and str(i.get("path", "")).startswith("transcribe")]
+    check("默认转写引擎过校验", not errors, json.dumps(errors, ensure_ascii=False))
+
+
 def main():
     case_events_run()
     case_events_any_output()
@@ -1085,6 +1110,7 @@ def main():
     case_translate_maps_quota_marker()
     case_token_ledger()
     case_defaults_recalibrated()
+    case_transcribe_default_follows_arch()
     case_quota_body_and_split_stop()
     case_split_honours_stop_early()
     case_fallback_quality_is_reachable()

@@ -7,8 +7,16 @@ Point it at a directory (local or an SSH-mounted NAS), tell it how to pick the n
 Whisper, translates with the LLM you already configured in DSH, burns the subtitle with ffmpeg, and can do all of it
 again tomorrow at a fixed time.
 
-> **Platform**: macOS only (`os: ["darwin"]`). The engine targets Apple Silicon through `mlx_whisper`, and scheduling
-> uses `launchd`. Requires DeepSeek Harness `>= 0.2.0` and Node `>= 20`.
+![The Subtitle Studio settings panel: eight tabs across the top, one model dropdown on the Engine tab, a source and
+an output card that only ask for SSH fields when a folder is remote, and a five-step checklist on first run](docs/preview.svg)
+
+*An annotated schematic of the panel, not a screenshot — the shipped UI follows your DSH locale and theme, and the
+real folder paths and model names are yours.*
+
+> **Platform**: macOS only (`os: ["darwin"]`), on both Apple Silicon and Intel. The transcriber defaults to
+> `mlx_whisper` on Apple Silicon and `faster-whisper` on an Intel Mac (picked from the same dropdown, and the
+> self-check offers the matching install), and scheduling uses `launchd`. Requires DeepSeek Harness `>= 0.2.0` and
+> Node `>= 20`.
 
 ---
 
@@ -257,13 +265,13 @@ run: the engine logs one line and translates without it.
 node --check index.js && node --check client.js   # syntax
 python3 -m compileall -q engine                   # syntax
 cd test
-node e2e.mjs                                      # host bridge + relay + one-click installs, 173 checks
+node e2e.mjs                                      # host bridge + relay + one-click installs, 182 checks
 python3 multi_dir_test.py                         # multi-directory engine, 29 checks
 python3 quality_test.py                           # line wrapping, audio, scheduler symmetry, 25 checks
 python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, ffmpeg resolution, 85 checks
-python3 v15_test.py                               # reasoning effort, truncated batches, split retries, error classification, 30 checks
-python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 93 checks
-node ui-smoke.mjs                                 # panel render, locale re-activation, hook-order guard, first-run checklist, 167 checks
+python3 v15_test.py                               # reasoning effort, truncated batches, split retries, error classification, 36 checks
+python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 141 checks
+node ui-smoke.mjs                                 # panel render, locale re-activation, hook-order guard, first-run checklist, 168 checks
 node real-smoke.mjs                               # real engine against a fake HOME, 22 checks
 bash release-gate.sh                              # publish checklist: privacy greps, syntax,
 #   docs, then every suite above. Exit 0 means publishable.

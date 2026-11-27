@@ -11,6 +11,7 @@
 
 import json
 import os
+import platform
 import re
 import stat
 
@@ -102,6 +103,9 @@ DEFAULTS = {
         "fontSize": 0,
     },
     "transcribe": {
+        # mlx 只在 Apple Silicon 上跑得起来；其它机器默认 faster-whisper，
+        # 与宿主 index.js 的 defaultTranscribeEngine() 同一口径。
+        "engine": "mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "faster",
         "whisperModel": "",
         "language": "ja",
         "keepAudio": False,
@@ -109,7 +113,6 @@ DEFAULTS = {
         "maxLineMs": 4000,
         "pauseMs": 500,
         "silenceDb": -50,
-        "engine": "mlx",
         # 反幻觉参数（REQ-02 / REQ-03）：0 / false = 关闭对应行为
         "conditionOnPreviousText": False,
         "temperature": 0,

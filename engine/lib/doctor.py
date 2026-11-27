@@ -21,7 +21,7 @@ from lib.remote import Endpoint, tcp_probe
 from lib.runtime import (EngineError, df_avail_bytes, ensure_dir, expand, file_size,
                          human_size, now_iso, read_text, run_cmd)
 
-ENGINE_VERSION = "1.6.1"
+ENGINE_VERSION = "1.6.2"
 SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|tvly-[A-Za-z0-9_\-]{8,})")
 
 

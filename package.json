@@ -1,6 +1,6 @@
 {
   "name": "dsh-subtitle-studio",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "type": "module",
   "description": "Subtitle Studio for DeepSeek Harness: pick videos, transcribe, translate, burn in subtitles and deliver — a configurable local pipeline with a settings panel and an engine CLI bridge. macOS only (Apple Silicon recommended).",
   "license": "MIT",

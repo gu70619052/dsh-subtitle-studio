@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.6.2 — 2026-11-27
+
+- The default transcriber now follows the CPU: `mlx_whisper` on Apple Silicon,
+  `faster-whisper` on an Intel Mac, computed once at load on both the host and the
+  engine side instead of hardcoded, so a first install on Intel no longer opens red.
+  The panel choice is unchanged — this is only what a fresh config starts with.
+- `README.md` now embeds `docs/preview.svg`, redrawn as an annotated schematic of the
+  current panel (eight tabs, one model dropdown, conditional SSH fields, the first-run
+  checklist). It is labelled a schematic, so no real paths or file names ship in it.
+- The platform note in `README.md` no longer claims Apple Silicon only.
+- Tests: e2e 177 → 182 (architecture split on both sides, plus the docs figure guard),
+  v1.6 135 → 141.
+
 All dates are the day the release was tagged. Config keys added by a release keep
 working on older files: everything is deep-merged over defaults, so an upgrade
 never needs a migration step.
