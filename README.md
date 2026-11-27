@@ -233,13 +233,13 @@ run: the engine logs one line and translates without it.
 node --check index.js && node --check client.js   # syntax
 python3 -m compileall -q engine                   # syntax
 cd test
-node e2e.mjs                                      # host bridge + relay + one-click installs, 165 checks
+node e2e.mjs                                      # host bridge + relay + one-click installs, 169 checks
 python3 multi_dir_test.py                         # multi-directory engine, 29 checks
 python3 quality_test.py                           # line wrapping, audio, scheduler symmetry, 25 checks
 python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, ffmpeg resolution, 85 checks
 python3 v15_test.py                               # reasoning effort, truncated batches, split retries, error classification, 30 checks
-python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 63 checks
-node ui-smoke.mjs                                 # panel render, locale re-activation, reasoning picker, first-run checklist, 154 checks
+python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 93 checks
+node ui-smoke.mjs                                 # panel render, locale re-activation, reasoning picker, first-run checklist, 161 checks
 node real-smoke.mjs                               # real engine against a fake HOME, 22 checks
 bash release-gate.sh                              # publish checklist: privacy greps, syntax,
 #   docs, then every suite above. Exit 0 means publishable.
