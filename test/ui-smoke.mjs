@@ -265,6 +265,19 @@ interceptRoute('/api/dsh-subtitle-studio/describe', (payload) => {
   return payload
 })
 
+// 面板崩了以后，浏览器半边把报错交给宿主；这里只记录它发了什么
+// （宿主那一侧由 e2e.mjs 验证：写进 logs/host.log、路径折成 ~）。
+const clientErrorMock = { calls: [] }
+
+routes.set('/api/dsh-subtitle-studio/client-error', {
+  path: '/api/dsh-subtitle-studio/client-error',
+  async handler(request, response) {
+    const body = await readRequestBody(request)
+    clientErrorMock.calls.push(body)
+    sendJson(response, 200, { ok: true })
+  },
+})
+
 routes.set('/api/dsh-subtitle-studio/notify-secret', {
   path: '/api/dsh-subtitle-studio/notify-secret',
   async handler(request, response) {
@@ -330,10 +343,11 @@ let current = null
 let dirty = false
 let pending = []
 
-function slot(init) {
-  const { fiber, index } = current
+function slot(init, kind) {
+  const { fiber, index, seen } = current
   if (fiber.hooks[index] === undefined) fiber.hooks[index] = init()
   const value = fiber.hooks[index]
+  if (seen !== undefined) seen.push(kind === undefined ? 'hook' : kind)
   current.index += 1
   return value
 }
@@ -343,8 +357,14 @@ const React = {
   createElement(type, props, ...children) {
     return { __el: true, type, props: { ...(props || {}), children: children.flat(Infinity) } }
   },
+  Component: class Component {
+    constructor(props) {
+      this.props = props || {}
+      this.state = {}
+    }
+  },
   useState(initial) {
-    const box = slot(() => ({ value: typeof initial === 'function' ? initial() : initial }))
+    const box = slot(() => ({ value: typeof initial === 'function' ? initial() : initial }), 'useState')
     const set = (next) => {
       const value = typeof next === 'function' ? next(box.value) : next
       if (value !== box.value) {
@@ -355,10 +375,10 @@ const React = {
     return [box.value, set]
   },
   useRef(initial) {
-    return slot(() => ({ current: initial }))
+    return slot(() => ({ current: initial }), 'useRef')
   },
   useMemo(factory, deps) {
-    const box = slot(() => ({ deps: undefined, value: undefined }))
+    const box = slot(() => ({ deps: undefined, value: undefined }), 'useMemo')
     const next = deps === undefined ? undefined : JSON.stringify(deps)
     if (box.deps !== next) {
       box.value = factory()
@@ -367,11 +387,18 @@ const React = {
     return box.value
   },
   useCallback(fn, deps) {
-    return React.useMemo(() => fn, deps)
+    const box = slot(() => ({ deps: undefined, value: undefined }), 'useCallback')
+    const next = deps === undefined ? undefined : JSON.stringify(deps)
+    if (box.deps !== next) {
+      // useCallback 返回的是函数本身，不是调用结果。
+      box.value = fn
+      box.deps = next
+    }
+    return box.value
   },
   useEffect(fn, deps) {
     const index = current.index
-    const box = slot(() => ({ deps: undefined, ran: false }))
+    const box = slot(() => ({ deps: undefined, ran: false }), 'useEffect')
     pending.push({
       fiber: current.fiber,
       index,
@@ -383,6 +410,9 @@ const React = {
 }
 
 const reactModule = { default: React, ...React }
+// 真 React 用 prototype.isReactComponent 区分类组件；面板的错误边界是类组件，
+// 这里照抄，好让测试真的跑一遍边界（而不是把它当成普通函数组件）。
+React.Component.prototype.isReactComponent = {}
 
 /** Render one element tree, executing function components and collecting text. */
 function renderElement(element, pathKey) {
@@ -392,7 +422,15 @@ function renderElement(element, pathKey) {
     const parts = element.map((child) => renderElement(child, pathKey))
     return { text: parts.map((part) => part.text).join(''), children: parts.flatMap((part) => (part.tag ? [part] : part.children || [])) }
   }
-  if (element.__el !== true) return { text: '' }
+  if (element.__el !== true) {
+    // 真 React 的硬约束：子元素只能是字符串、数字、元素、数组、null、布尔。
+    // 旧桩把对象静默丢掉，真实的渲染错误会被测试放过 —— 这里改成跟真 React 一样抛。
+    throw new Error(
+      `Objects are not valid as a React child (found: ${
+        element === null ? 'null' : typeof element
+      }${typeof element === 'object' ? ` with keys {${Object.keys(element).slice(0, 6).join(', ')}}` : ''})`,
+    )
+  }
   const { type, props } = element
   if (type === FRAGMENT) {
     const parts = (props.children || []).map((child) => renderElement(child, pathKey))
@@ -401,15 +439,55 @@ function renderElement(element, pathKey) {
   if (typeof type === 'function') {
     const name = type.name || 'Anon'
     const key = `${pathKey}>${name}`
+    if (type.prototype && type.prototype.isReactComponent !== undefined) {
+      // 类组件：照 React 的错误边界语义跑 —— 子树抛错时，边界用自己的
+      // getDerivedStateFromError 换一份降级视图，而不是让整页变空白。
+      const instance = new type(props)
+      instance.props = props
+      try {
+        return renderElement(instance.render(), key)
+      } catch (error) {
+        const derived = typeof type.getDerivedStateFromError === 'function' ? type.getDerivedStateFromError(error) : null
+        if (derived === null || derived === undefined) throw error
+        instance.state = { ...(instance.state || {}), ...derived }
+        if (typeof instance.componentDidCatch === 'function') instance.componentDidCatch(error, { componentStack: key })
+        return renderElement(instance.render(), key)
+      }
+    }
     const previous = current
-    const fiber = fibers.get(key) || { hooks: [], key }
+    const fiber = fibers.get(key) || { hooks: [], kinds: null, key }
     fibers.set(key, fiber)
-    current = { fiber, index: 0 }
+    const seen = []
+    current = { fiber, index: 0, seen }
     let output
     try {
       output = type(props)
     } finally {
       current = previous
+    }
+    // 真 React 的第三条硬约束：同一次挂载里，每次渲染必须调用同一批 hook、
+    // 顺序一致。提前 return 少调一个 useEffect，下一次补上就是 error #310
+    // 「Rendered more hooks than during the previous render」，整棵子树被卸载
+    // → 实机整页空白、测试却全绿。这里把 React 的 #310 变成测试失败。
+    if (fiber.kinds !== null && (fiber.kinds.length !== seen.length || fiber.kinds.some((kind, index) => kind !== seen[index]))) {
+      const columns = (a, b) =>
+        a
+          .map((kind, index) => `${String(index + 1).padStart(2)}. ${kind.padEnd(12)} ${b[index] || ''}`)
+          .join('\n')
+      throw new Error(
+        `React has detected a change in the order of Hooks called by ${name}.\n` +
+          `   Previous render            Next render\n   ------------------------------------------------------\n${columns(
+            fiber.kinds,
+            seen,
+          )}\n   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n` +
+          '（大概率是组件里有提前 return，而 return 之后还有 hook）',
+      )
+    }
+    fiber.kinds = seen
+    if (output === undefined) {
+      // 真 React：组件返回 undefined 会抛 "Nothing was returned from render"，
+      // 整棵子树被卸载 —— 旧桩把它当成空渲染，页面于是「测试全绿、实机空白」。
+      throw new Error(`${name} returned undefined instead of a React element`)
     }
     return renderElement(output, key)
   }
@@ -599,9 +677,88 @@ check('a degraded re-registration still resolves panel text', (dict[activeLang][
 check('locale keys are in parity', Object.keys(dict.zh).length === Object.keys(dict.en).length, `${Object.keys(dict.zh).length}/${Object.keys(dict.en).length}`)
 check('section registered at settings.section', moduleExports.section?.name === 'settings.section' && moduleExports.section?.order >= 40)
 check('section label is localized', typeof moduleExports.section?.label === 'function' && moduleExports.section.label() === '字幕工坊')
+// 边界必须是 Panel 的父组件：v1.6.0 的空白就是 Panel 自己抛的（提前 return
+// 之后又调 hook → error #310），写在 Panel 内部的边界永远看不到这个错误。
+check(
+  'the settings slot mounts the panel behind the boundary',
+  typeof moduleExports.__subtitleStudio?.StudioSettings === 'function' &&
+    moduleExports.Panel === moduleExports.__subtitleStudio.StudioSettings &&
+    moduleExports.Panel !== moduleExports.__subtitleStudio.Panel,
+)
+
+/* A render error used to empty the whole settings column: React unmounts the
+ * tree when a component throws, and the page had no way to show the error. */
+check('the panel ships a render-error boundary', typeof moduleExports.__subtitleStudio?.ErrorBoundary === 'function')
+const Thrower = () => {
+  throw new Error('boom from the panel')
+}
+let boundaryTree = null
+let boundaryError = null
+const realConsoleError = console.error
+console.error = () => {}
+try {
+  boundaryTree = await render(() =>
+    React.createElement(moduleExports.__subtitleStudio.ErrorBoundary, null, React.createElement(Thrower)),
+  )
+} catch (error) {
+  boundaryError = String(error?.message ?? error)
+} finally {
+  console.error = realConsoleError
+}
+check(
+  'a render error becomes a readable card, not a blank page',
+  boundaryError === null && String(boundaryTree?.text ?? '').includes('字幕工坊面板渲染失败'),
+  boundaryError ?? String(boundaryTree?.text ?? '').slice(0, 80),
+)
+await sleep(50)
+check(
+  'a caught render error is reported to the host',
+  clientErrorMock.calls.some((call) => call.kind === 'render-error' && String(call.message ?? '').includes('boom from the panel')),
+  JSON.stringify(clientErrorMock.calls.slice(-1)),
+)
 
 let tree = await render(() => React.createElement(moduleExports.Panel))
 check('panel renders without throwing', tree !== null && typeof tree.text === 'string')
+
+/* --------------------- hook-order regression pins --------------------- */
+
+// v1.6.0 的实机空白就是这么来的：Panel 在两个提前 return 之后还调了 hook，
+// 首屏（data===null）少跑一个 useEffect，数据到达后多跑一个 —— 真 React 抛
+// error #310，整棵子树被卸载，面板变空白，而旧测试桩毫无反应。
+{
+  let violated = null
+  function HookShifter({ on }) {
+    React.useState(0)
+    if (!on) return React.createElement('div', null, 'short')
+    React.useEffect(() => {}, [])
+    return React.createElement('div', null, 'long')
+  }
+  try {
+    await render(() => React.createElement(HookShifter, { on: false }))
+    await render(() => React.createElement(HookShifter, { on: true }))
+  } catch (error) {
+    violated = String(error?.message ?? error)
+  }
+  check('the harness rejects a hook that appears after an early return', violated !== null && violated.includes('change in the order of Hooks'), violated ?? 'no error raised')
+}
+
+{
+  // 同一条规则的静态版本：真 React 在每次渲染里按同一顺序调用同一批 hook，
+  // 所以「提前 return 之后再调 hook」这种写法永远不合法。用源码顺序检查它，
+  // 好处是不依赖测试有没有恰好走到那条渲染路径。
+  // 只看六空格缩进的语句 = Panel 函数体本身；嵌套组件的 hook 缩进更深，不算。
+  const source = fs.readFileSync(path.join(PACKAGE, 'client.js'), 'utf8')
+  const start = source.indexOf('    function Panel() {')
+  const body = source.slice(start, source.indexOf('\n    }\n', start))
+  const firstTopReturn = body.search(/\n {6}if \([^\n]*\) \{\n {8}return |\n {6}if \([^\n]*\) return |\n {6}return /)
+  const hookStatement = /\n {6}(?:const \[[^\n]* = |const \w+ = |let \w+ = )?React\.use[A-Za-z]+\(/
+  const late = body.slice(firstTopReturn + 1).match(hookStatement)
+  check(
+    'Panel calls every hook before its first top-level return',
+    start !== -1 && firstTopReturn !== -1 && late === null,
+    late === null ? `firstTopReturn@${firstTopReturn}` : late[0].trim(),
+  )
+}
 check('panel shows the title', tree.text.includes('字幕工坊'))
 check('panel shows the description', tree.text.includes('config.json'))
 check('overview lists the config path', tree.text.includes(path.join(DATA, 'config.json')))
@@ -925,7 +1082,9 @@ check('the two faster options do not share a label',
 const newPaths = ['output.mode', 'subtitles.styleTemplate',
   'transcribe.conditionOnPreviousText', 'transcribe.temperature',
   'transcribe.hallucinationSilenceThreshold', 'transcribe.minAvgLogprob',
-  'transcribe.maxNoSpeechProb', 'transcribe.keepThanksPhrases', 'transcribe.keepRepeats']
+  'transcribe.maxNoSpeechProb', 'transcribe.keepThanksPhrases', 'transcribe.keepRepeats',
+  'notify.successWhen', 'selection.skipOwnOutputs', 'engine.reasoningEffort',
+  'engine.batchSize', 'engine.maxTokens']
 const missingHints = newPaths.filter((path) =>
   dict.zh[`h.${path}`] === undefined || dict.en[`h.${path}`] === undefined ||
   dict.zh[`f.${path}`] === undefined || dict.en[`f.${path}`] === undefined)
@@ -947,6 +1106,12 @@ check('no hardcoded colours', /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(source) === fal
   check('engine tab: one real <select> replaces the datalist + provider + kind triangle',
     modelSelect !== undefined && tagNodes(eng, 'datalist').length === 0,
     `selects=${tagNodes(eng, 'select').length}`)
+  // REQ-64: the recalibration hint has to reach the screen. A STRINGS key that
+  // does not match a real field path fails silently (guarded in v1.4), and the
+  // source scan only proves the key exists, not that the row renders.
+  check('engine tab: the measured batch/token hint is actually rendered',
+    eng.text.includes('16,384') && eng.text.includes('185'),
+    `16384=${eng.text.includes('16,384')} 185=${eng.text.includes('185')}`)
 
   const labels = (modelSelect?.props.children ?? []).flat(6).filter((c) => c?.type === 'optgroup').map((g) => g.props.label)
   check('engine tab: DSH providers and local Ollama are peers in that one dropdown',

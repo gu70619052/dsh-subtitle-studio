@@ -29,6 +29,17 @@ fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 
+# ---------------------------------------------------------------------------
+# Live-data guard. Every suite is supposed to run against a sandbox HOME, but a
+# stray script that resolves the *default* data dir would rewrite the operator's
+# real config mid-gate (one did, during a release check). Snapshot the hash of
+# the live config up front and fail the gate if anything moved it.
+# ---------------------------------------------------------------------------
+hash_file() { (shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null) | cut -c1-64; }
+LIVE_CONFIG="${HOME}/.dsh/data/subtitle-studio/config.json"
+LIVE_HASH=""
+if [ -f "$LIVE_CONFIG" ]; then LIVE_HASH="$(hash_file "$LIVE_CONFIG")"; fi
+
 # Paths excluded from the scan: the gate itself contains the patterns it looks
 # for, and sandboxes hold whatever the last test run left behind.
 scan_files() {
@@ -221,6 +232,14 @@ if [ -e test/sandbox ] || [ -e test/sandbox-ui ] || [ -e test/sandbox-real ]; th
   bad "test sandboxes survived the cleanup"
 else
   pass "test sandboxes removed"
+fi
+
+if [ -n "$LIVE_HASH" ]; then
+  if [ "$(hash_file "$LIVE_CONFIG")" = "$LIVE_HASH" ]; then
+    pass "live config untouched by the gate"
+  else
+    bad "a suite rewrote ${LIVE_CONFIG} (restored from state/engine-config.json, then re-run)"
+  fi
 fi
 
 printf '\n=== release gate: %s failures ===\n' "$fail"

@@ -193,8 +193,8 @@ const DEFAULT_CONFIG = Object.freeze({
     model: '',
     temperature: 0.1,
     seed: 42,
-    maxTokens: 8000,
-    batchSize: 30,
+    maxTokens: 16000,
+    batchSize: 20,
     reasoningEffort: '',
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: '',
@@ -1517,7 +1517,9 @@ function spendAllowed() {
 /** @returns {{ok:boolean, status:number, code:string}|null} null when allowed. */
 function spendGate() {
   if (!spendAllowed()) {
-    return { ok: false, status: 429, code: 'rate-limited' }
+    // local-budget，不是 rate-limited：引擎对后者的反应是中止整轮不拆批，
+    // 「每分钟调用预算用完」显然不该触发那个动作（审计 r16d-quality D-P1）。
+    return { ok: false, status: 429, code: 'local-budget' }
   }
   return null
 }
@@ -1617,8 +1619,18 @@ async function callLlm(ctx, input) {
     // Upstream throttling arrives wrapped in whatever the adapter threw. A
     // rate limit is retryable but needs minutes, not the two-second retry a
     // generic stream error gets, so name it before it is flattened away.
+    // Chinese alternatives must stay phrases: the bare words for "quota" or
+    // "allowance" also show up in ordinary 5xx text (a billing-config
+    // notice, an echoed model name), and a false positive here makes the
+    // engine stop the whole run instead of retrying it.
     const throttled = !aborted
-      && /\b429\b|rate[_ -]?limit|too many requests|insufficient quota|usage ceiling/i.test(message)
+      && new RegExp('\\b429\\b|rate[_ -]?limit|too many requests|insufficient quota'
+        + '|usage ceiling|token plan'
+        + '|\\u7528\\u91cf\\u4e0a\\u9650|\\u4f7f\\u7528\\u4e0a\\u9650'
+        + '|\\u989d\\u5ea6\\u4e0d\\u8db3|\\u989d\\u5ea6\\u5df2\\u7528\\u5c3d|\\u989d\\u5ea6\\u8017\\u5c3d'
+        + '|\\u8d85\\u51fa\\u989d\\u5ea6|\\u914d\\u989d\\u4e0d\\u8db3|\\u914d\\u989d\\u5df2\\u7528\\u5c3d'
+        + '|\\u8d85\\u51fa\\u914d\\u989d|\\u8bf7\\u6c42\\u8fc7\\u4e8e\\u9891\\u7e41|\\u901f\\u7387\\u9650\\u5236',
+        'i').test(message)
     // The provider saying "this model has no such effort" is a configuration
     // answer, not a broken stream: asking again with the same effort gets the
     // same refusal, so name it instead of letting the caller retry it.
@@ -3223,6 +3235,28 @@ function makeRoutes(ctx) {
       return true
     }),
 
+    // The panel's own crash reports. The browser half posts the message and
+    // the stack when React throws or a promise rejects; the host writes them
+    // to logs/host.log, so a blank settings page can be diagnosed without
+    // opening DevTools. Only the three fields below are read, the paths are
+    // folded to ~ and the whole body is size-capped.
+    exact('client-error', 'POST', async (request, response) => {
+      let body
+      try {
+        body = await readJsonBody(request, 64 * 1024)
+      } catch {
+        writeJson(response, 400, { ok: false, error: 'bad body', code: 'bad-body' })
+        return true
+      }
+      const kind = String(body?.kind ?? 'error').slice(0, 40)
+      const message = scrubHomePaths(String(body?.message ?? '').slice(0, 2000))
+      const stack = scrubHomePaths(String(body?.stack ?? '').slice(0, 4000))
+      appendHostLog(`client ${kind}: ${message}`)
+      if (stack !== '') appendHostLog(`client ${kind} stack: ${stack}`)
+      writeJson(response, 200, { ok: true })
+      return true
+    }),
+
     // The engine's way into the running DSH llm service. Gated by a shared
     // secret, a per-minute budget and a concurrency cap. Being honest about
     // what the secret buys: it keeps *other users* out (the file is 0600 under
@@ -3320,7 +3354,8 @@ function makeRoutes(ctx) {
         }
         if (result.code === 'upstream-rate-limit') {
           // The provider itself said "slow down". Back off like it means it.
-          writeJson(response, 429, { ok: false, error: result.error, code: 'rate-limited' })
+          // 真·上游额度：用 upstream-rate-limit 与本地闸门区分开
+          writeJson(response, 429, { ok: false, error: result.error, code: 'upstream-rate-limit' })
           return true
         }
         const status = result.code === 'timeout' ? 504 : 502

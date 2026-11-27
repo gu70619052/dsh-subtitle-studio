@@ -731,8 +731,52 @@ const throttledUpstream = await call(
 )
 check(
   'relay: an upstream rate limit is a 429 the engine backs off from',
-  throttledUpstream.status === 429 && throttledUpstream.body.code === 'rate-limited',
+  throttledUpstream.status === 429 && throttledUpstream.body.code === 'upstream-rate-limit',
   JSON.stringify(throttledUpstream.body).slice(0, 220),
+)
+
+// REQ-62: a Chinese upstream says 「已达到 Token Plan 用量上限」 with no
+// numeric 429 and no rate_limit_error type. Missed here, the engine reads a
+// plain 502 and hammers the same wall 24 more times (measured 2026-11-27).
+throwWith = '{"error":{"message":"已达到 Token Plan 用量上限，请升级 Token Plan 套餐或购买积分补充用量 (2056)"}}'
+const quotaZh = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a Chinese quota message is still a 429, not a generic 502',
+  quotaZh.status === 429 && quotaZh.body.code === 'upstream-rate-limit',
+  JSON.stringify(quotaZh.body).slice(0, 220),
+)
+
+// Same coin's other face (audit r16d-host, P1): a billing notice or an
+// echoed model name that merely contains the bare word for "quota" is an
+// ordinary failure. Classifying it as rate-limited would tell the engine to
+// abandon the whole run instead of retrying it, so the Chinese alternatives
+// have to stay phrases.
+throwWith = '{"error":{"message":"模型额度配置已更新，服务暂时不可用，请稍后重试 (500)"}}'
+const quotaLookalike = await call(
+  'llm',
+  'POST',
+  { provider: 'fake-provider', model: 'fake-model', prompt: 'hello' },
+  { 'x-subtitle-studio-token': token },
+)
+check(
+  'relay: a 5xx that only mentions quota is NOT treated as rate-limited',
+  quotaLookalike.status === 502 && quotaLookalike.body.code !== 'upstream-rate-limit',
+  JSON.stringify(quotaLookalike.body).slice(0, 220),
+)
+
+// REQ-64: the recalibrated defaults must be what the panel actually serves,
+// not just what the source says.
+const defaultsSeen = await call('describe')
+const de = defaultsSeen.body?.data?.defaults?.engine ?? {}
+check(
+  'describe: shipped defaults are batch 20 / maxTokens 16000',
+  de.batchSize === 20 && de.maxTokens === 16000,
+  JSON.stringify({ batch: de.batchSize, max: de.maxTokens }),
 )
 
 // The failure this release exists for: the model stops at max-tokens. The
@@ -798,8 +842,16 @@ const throttled = await call(
 )
 check(
   'relay: per-minute budget trips -> 429',
-  throttled.status === 429 && throttled.body.code === 'rate-limited',
+  throttled.status === 429 && throttled.body.code === 'local-budget',
   JSON.stringify(throttled.body),
+)
+// The engine decides "retry this batch" vs "stop the whole run" purely from
+// this code, so the two 429s must not share a name (audit r16d-quality D-P1).
+check(
+  'relay: a local budget 429 is not spelled like an upstream quota wall',
+  throttled.body.code === 'local-budget'
+  && throttledUpstream.body.code === 'upstream-rate-limit',
+  JSON.stringify({ local: throttled.body.code, upstream: throttledUpstream.body.code }),
 )
 const throttledTest = await call('model-test', 'POST', { provider: 'fake-provider', model: 'fake-model' })
 check('model-test shares the same budget -> 429', throttledTest.status === 429, JSON.stringify(throttledTest.body))
@@ -1171,6 +1223,27 @@ check(
   check('fix-dep: the install is written to the host log',
     /fix-dep brew-ffmpeg-full: ok in \d+ms/.test(logText),
     logText.split('\n').filter((line) => line.includes('fix-dep')).slice(-2).join(' | '))
+
+  // 面板自己崩了也要留下痕迹：浏览器把报错交给宿主，宿主写进 host.log。
+  const clientError = await call('client-error', 'POST', {
+    kind: 'render-error',
+    message: `boom at ${process.env.HOME ?? '/tmp'}/Library/thing`,
+    stack: 'Error: boom\n    at Panel',
+  })
+  check('client-error: the panel may report a crash',
+    clientError.status === 200 && clientError.body.ok === true,
+    `${clientError.status} ${JSON.stringify(clientError.body).slice(0, 80)}`)
+  const clientLog = fs.existsSync(hostLog) ? fs.readFileSync(hostLog, 'utf8') : ''
+  check('client-error: the crash lands in the host log',
+    clientLog.includes('client render-error: boom'),
+    clientLog.split('\n').filter((line) => line.includes('client render-error')).slice(-1).join(' | '))
+  check('client-error: home paths in a crash report are folded to ~',
+    clientLog.includes('~/Library/thing') && !clientLog.includes(String(process.env.HOME ?? '\u0000')),
+    clientLog.split('\n').filter((line) => line.includes('client render-error')).slice(-1).join(' | '))
+  const clientErrorGet = await call('client-error')
+  check('client-error: only the panel may write it, and only by POST',
+    clientErrorGet.status === 405,
+    String(clientErrorGet.status))
 
   // 连点两次：第二条必须被挡在门外，而不是让 brew 抢锁报一个看不懂的失败。
   fs.writeFileSync(

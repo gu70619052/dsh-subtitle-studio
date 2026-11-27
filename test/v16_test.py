@@ -12,10 +12,13 @@
 4. 两个新配置键的校验与宿主默认值/字段表。
 """
 
+import importlib
+import io
 import json
 import os
 import sys
 import tempfile
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.abspath(os.path.join(HERE, "..", "engine"))
@@ -25,7 +28,8 @@ if not os.path.isdir(ENGINE_DIR):
 sys.path.insert(0, ENGINE_DIR)
 
 from lib import config as config_mod  # noqa: E402
-from lib import notify, pipeline, runtime  # noqa: E402
+from lib import notify, pipeline, quality as quality_mod  # noqa: E402
+from lib import runtime  # noqa: E402
 from lib import select as selection  # noqa: E402
 
 FAILURES = []
@@ -695,6 +699,367 @@ def case_record_only_on_success():
           [c for c in calls if c[0] == "record"] == [], str(calls))
 
 
+
+# ================================================== REQ-61/62/63/64（v1.6.1）
+
+class _QuietLog(object):
+    def info(self, *a, **k):
+        pass
+
+    warn = info
+
+    def error(self, *a, **k):
+        pass
+
+
+def _load_vendor():
+    vendor = os.path.join(ENGINE_DIR, "vendor")
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
+    import translate_srt
+    return translate_srt
+
+
+JA = "お待たせしました、これから始めます"
+JA_DATE = "配信は今週末の23時59分まで"
+ZH = "今天也要一起加油"
+ZH_NAME = "也请记得带上话题标签「テスト局」一起讨论"
+LATIN = "OK 1234"
+
+
+
+def case_quota_body_and_split_stop():
+    """200-body 的额度 code 与拆批阶段的早停（审计 D-2 / D-3）。"""
+    tr = _load_vendor()
+    saved = dict(tr.GEN_OPTS)
+    old_urlopen = urllib.request.urlopen
+    tr.STOP_EARLY = False
+    tr.RUN_STATS["quota"] = 0
+    try:
+        tr.GEN_OPTS.update(engine="dsh", provider="p", model="m",
+                           max_tokens=8000, batch_size=30)
+
+        def body_200(*a, **k):
+            return io.BytesIO(json.dumps(
+                {"ok": False, "code": "upstream-rate-limit",
+                 "error": "已达到用量上限"}).encode("utf-8"))
+        urllib.request.urlopen = body_200
+        text, meta = tr._call_dsh_bridge("s", "u", "p", "m")
+        check("200-body 的额度 code 触发早停",
+              text is None and meta.get("fatal") is True and tr.STOP_EARLY is True,
+              json.dumps(meta))
+        check("200-body 的额度计入 quota 账", tr.RUN_STATS["quota"] >= 1,
+              str(tr.RUN_STATS["quota"]))
+    finally:
+        urllib.request.urlopen = old_urlopen
+        tr.GEN_OPTS.clear()
+        tr.GEN_OPTS.update(saved)
+        tr.STOP_EARLY = False
+
+
+def case_split_honours_stop_early():
+    """第一个 part 撞上额度后，第二个 part 不许再发问（审计 D-3）。"""
+    tr = _load_vendor()
+    saved = dict(tr.GEN_OPTS)
+    old = tr.translate_batch
+    calls = []
+    tr.STOP_EARLY = False
+    try:
+        tr.GEN_OPTS.update(engine="dsh", provider="p", model="m",
+                           max_tokens=8000, batch_size=30)
+
+        def fake(batch, *a, **k):
+            calls.append(len(batch))
+            tr.STOP_EARLY = True      # 模拟这一批撞上额度墙
+            return {}, {"fatal": True, "code": "upstream-rate-limit"}
+        tr.translate_batch = fake
+        batch = [{"idx": i,
+                  "start": "00:00:%02d,000 --> 00:00:%02d,500" % (i, i),
+                  "text": "本文%d" % i} for i in (1, 2, 3, 4)]
+        got = tr.translate_batch_resilient(batch, "k", "m", False, "", depth=0)
+        check("额度置位后拆批只发出一半", len(calls) == 1, str(calls))
+        check("拆批停下的块仍原样留底",
+              [got[i] for i in (1, 2, 3, 4)] == ["本文1", "本文2", "本文3", "本文4"],
+              json.dumps(got, ensure_ascii=False))
+    finally:
+        tr.translate_batch = old
+        tr.GEN_OPTS.clear()
+        tr.GEN_OPTS.update(saved)
+        tr.STOP_EARLY = False
+
+
+def case_fallback_quality_is_reachable():
+    """共享模块装不上时必须退化到内置副本，且判定与共享版一致（审计 C）。"""
+    tr = _load_vendor()
+    lib_pkg = sys.modules.get("lib")
+    saved_attr = getattr(lib_pkg, "quality", None)
+    saved_entry = sys.modules.get("lib.quality", "<absent>")
+    try:
+        # from lib import quality 走的是「包属性优先」，所以必须把属性摘掉
+        # 再把 sys.modules 条目设成 None，才真造得出 ImportError
+        if lib_pkg is not None and saved_attr is not None:
+            delattr(lib_pkg, "quality")
+        sys.modules["lib.quality"] = None
+        reloaded = importlib.reload(tr)
+        check("共享模块丢失时退化到内置副本",
+              reloaded._quality is reloaded._FallbackQuality, str(reloaded._quality))
+        samples = [JA, ZH, "", "[听不清]", ZH_NAME, "カタカナonly"]
+        check("退化副本与共享模块逐条判定一致",
+              [reloaded._FallbackQuality.classify(s) for s in samples]
+              == [quality_mod.classify(s) for s in samples],
+              json.dumps([reloaded._FallbackQuality.classify(s) for s in samples]))
+        check("退化副本的 stats 与共享版同形",
+              reloaded._FallbackQuality.stats(samples) == quality_mod.stats(samples))
+        check("退化副本吃得下 (标识, 文本) 形态",
+              reloaded._FallbackQuality.stats(list(enumerate(samples)))
+              == quality_mod.stats(list(enumerate(samples))))
+    finally:
+        if saved_entry == "<absent>":
+            sys.modules.pop("lib.quality", None)
+        else:
+            sys.modules["lib.quality"] = saved_entry
+        if lib_pkg is not None and saved_attr is not None:
+            setattr(lib_pkg, "quality", saved_attr)
+        importlib.reload(tr)
+        check("恢复后仍指回共享模块", tr._quality is quality_mod, str(tr._quality))
+
+
+def case_pipeline_passes_batch_and_tokens():
+    """配置里的 batchSize / maxTokens 必须真的进 vendor 命令行（审计 D-5）。"""
+    captured = []
+    root = tempfile.mkdtemp(prefix="v16argv-")
+    src = os.path.join(root, "a.src.srt")
+    zh = os.path.join(root, "a.zh.srt")
+    io.open(src, "w", encoding="utf-8").write(
+        "1\n00:00:01,000 --> 00:00:02,000\n%s\n\n" % JA)
+    data = json.loads(json.dumps(config_mod.DEFAULTS))
+    data["engine"].update({"kind": "dsh", "provider": "p", "model": "m",
+                           "batchSize": 7, "maxTokens": 999})
+    cfg = Cfg(data, root=root)
+    original = pipeline.run_cmd
+    original_env = pipeline.engine_env
+    pipeline.engine_env = lambda cfg: {}
+
+    def fake_run(cmd, *a, **k):
+        captured.append(list(cmd))
+        return (0, "", "")
+    pipeline.run_cmd = fake_run
+    try:
+        try:
+            pipeline.translate(cfg, _QuietLog(), src, zh, {"system": ""})
+        except Exception:
+            pass
+    finally:
+        pipeline.run_cmd = original
+        pipeline.engine_env = original_env
+    joined = " ".join(str(part) for part in captured[0]) if captured else ""
+    check("vendor 收到 --batch-size 7", "--batch-size 7" in joined, joined[:240])
+    check("vendor 收到 --max-tokens 999", "--max-tokens 999" in joined, joined[:240])
+
+
+def case_quality_gate_precedes_ledger():
+    """顺序契约（审计变异 4）：质量门判失败必须发生在写台账之前。"""
+    src = io.open(os.path.join(ENGINE_DIR, "lib", "pipeline.py"),
+                  encoding="utf-8").read()
+    start = src.index("    def process_one(self, candidate):")
+    nxt = src.find("\n    def ", start + 10)
+    body = src[start:nxt if nxt != -1 else len(src)]
+    gate = body.find("quality_gate(")
+    ledger = body.find("record_translated(")
+    check("process_one 里质量门排在台账之前",
+          gate != -1 and ledger != -1 and gate < ledger,
+          "gate=%d ledger=%d" % (gate, ledger))
+    qg_start = src.index("def quality_gate(")
+    qg_end = src.find("\ndef ", qg_start + 10)
+    qg = src[qg_start:qg_end]
+    check("质量门在未译率越线时抛错而不是只记日志",
+          "untranslatedPct" in qg and "EngineError" in qg, qg[:160])
+
+
+def case_quality_ruler():
+    from lib import quality
+
+    def kind(text):
+        return quality.classify(text)
+
+    check("口径：整句日文判未译", kind(JA) == "untranslated", kind(JA))
+    check("口径：中文译文算译好", kind(ZH) == "translated", kind(ZH))
+    check("口径：占位符不算未译", kind("[听不清]") == "placeholder", kind("[听不清]"))
+    check("口径：空行不参与统计", kind("") == "empty", kind(""))
+    check("口径：无中文无假名只算嫌疑", kind(LATIN) == "suspect", kind(LATIN))
+    counts = quality.stats([JA, ZH, "[广告宣番]", LATIN])
+    check("口径：未译数与比例",
+          counts["untranslated"] == 1 and counts["total"] == 4
+          and counts["untranslatedPct"] == 25.0, json.dumps(counts, ensure_ascii=False))
+    check("口径：嫌疑单列不计入失败", counts["suspect"] == 1, json.dumps(counts))
+    check("口径：点名未译条目便于复查",
+          len(counts["untranslatedIds"]) == 1, json.dumps(counts["untranslatedIds"]))
+
+
+def case_quality_ruler_single_source():
+    tr = _load_vendor()
+    samples = [JA, JA_DATE, ZH, ZH_NAME, LATIN, "[听不清]", ""]
+    mine = [tr._FallbackQuality.classify(t) for t in samples]
+    theirs = [quality_mod.classify(t) for t in samples]
+    check("vendor 内置副本与 lib/quality 判定逐条一致", mine == theirs,
+          "%s vs %s" % (mine, theirs))
+    check("vendor 优先用共享模块而不是副本",
+          getattr(tr, "_quality", None) is quality_mod,
+          repr(getattr(tr, "_quality", None)))
+    check("vendor 副本与共享模块的统计口径同形",
+          tr._FallbackQuality.stats(samples) == quality_mod.stats(samples),
+          json.dumps([tr._FallbackQuality.stats(samples),
+                      quality_mod.stats(samples)], ensure_ascii=False))
+
+
+def case_translation_stats_sees_kana():
+    root = tempfile.mkdtemp(prefix="v16q-")
+    path = os.path.join(root, "zh.srt")
+    io.open(path, "w", encoding="utf-8").write(
+        "1\n00:00:01,000 --> 00:00:02,000\n%s\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\n%s\n\n"
+        "3\n00:00:03,000 --> 00:00:04,000\n%s\n\n" % (JA, ZH, ZH))
+    stats = pipeline.translation_stats(path)
+    check("流水线口径把假名残留算未译",
+          stats["untranslated"] == 1 and stats["blocks"] == 3, json.dumps(stats))
+    check("流水线口径输出比例与嫌疑字段",
+          stats["untranslatedPct"] == 33.33 and "suspect" in stats, json.dumps(stats))
+
+
+def case_quality_gate_raises():
+    root = tempfile.mkdtemp(prefix="v16g-")
+    source = os.path.join(root, "ja.srt")
+    zh = os.path.join(root, "zh.srt")
+    io.open(source, "w", encoding="utf-8").write(
+        "1\n00:00:01,000 --> 00:00:02,000\n%s\n\n" % JA)
+    # 整片没译：重跑（run_cmd 替身）也没救回来 → 必须判失败
+    io.open(zh, "w", encoding="utf-8").write(
+        "1\n00:00:01,000 --> 00:00:02,000\n%s\n\n" % JA)
+    old_run = pipeline.run_cmd
+    cfg = make_cfg()
+    try:
+        pipeline.run_cmd = lambda *a, **k: (0, "", "")
+        raised = None
+        try:
+            pipeline.quality_gate(cfg, _QuietLog(), source, zh)
+        except runtime.EngineError as exc:
+            raised = exc
+        check("未译率超阈值时质量门判失败", raised is not None
+              and "质量不达标" in str(raised), str(raised))
+        check("质量门失败带退出码 5（LLM 类）",
+              raised is not None and int(raised.code) == 5,
+              str(getattr(raised, "code", None)))
+        # 达标就绝不该抛：20 条里留一条「正确译文带假名专名」（实测 1/2404 的
+        # 已知误报），比例 5% 没越线，不能把整片判死。
+        body = "".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\n%s\n\n"
+                       % (i, i, i + 1, ZH) for i in range(1, 20))
+        body += "20\n00:00:20,000 --> 00:00:21,000\n%s\n\n" % ZH_NAME
+        io.open(zh, "w", encoding="utf-8").write(body)
+        stats = pipeline.quality_gate(cfg, _QuietLog(), source, zh)
+        check("达标译文不被质量门误杀", stats["untranslatedPct"] <= 5.0,
+              json.dumps(stats, ensure_ascii=False))
+    finally:
+        pipeline.run_cmd = old_run
+
+
+def case_quota_stops_self_help():
+    tr = _load_vendor()
+    old_stats = json.loads(json.dumps(tr.RUN_STATS))
+    old_stop = tr.STOP_EARLY
+    old_batch = tr.translate_batch
+    blocks = [{"idx": 1, "start": "00:00:01,000", "end": "00:00:02,000", "text": JA},
+              {"idx": 2, "start": "00:00:02,000", "end": "00:00:03,000", "text": JA}]
+    try:
+        for key in tr.RUN_STATS:
+            if isinstance(tr.RUN_STATS[key], list):
+                tr.RUN_STATS[key] = []
+            elif key == "tokens":
+                tr.RUN_STATS["tokens"] = {"input": 0, "output": 0, "reasoning": 0, "total": 0}
+            else:
+                tr.RUN_STATS[key] = 0
+        tr.STOP_EARLY = False
+        tr.translate_batch = lambda *a, **k: (None, {"fatal": True, "code": "rate-limited",
+                                                     "total_tokens": 0, "input_tokens": 0,
+                                                     "reasoning_tokens": 0})
+        got = tr.translate_batch_resilient(blocks, "k", "m", False, "")
+        check("额度耗尽时不再拆批自救", tr.RUN_STATS["split"] == 0,
+              str(tr.RUN_STATS["split"]))
+        check("拿不到译文就原样留底（不编内容）",
+              got == {1: JA, 2: JA}, json.dumps(got, ensure_ascii=False))
+        reasons = [r.get("reason") for r in tr.RUN_STATS["untranslated"]]
+        check("缺条如实记账并标原因", reasons.count("rate-limited") == 2,
+              json.dumps(reasons, ensure_ascii=False))
+        # 早停位由 _quota_hit 置（那是唯一认识「额度」的地方），不是自救层
+        tr.STOP_EARLY = False
+        meta = tr._quota_hit("rate-limited")
+        check("额度错误置早停位并计入 quota",
+              tr.STOP_EARLY is True and meta["fatal"] is True
+              and tr.RUN_STATS["quota"] >= 1, json.dumps(meta))
+    finally:
+        tr.translate_batch = old_batch
+        tr.RUN_STATS = old_stats
+        tr.STOP_EARLY = old_stop
+
+
+def case_translate_maps_quota_marker():
+    root = tempfile.mkdtemp(prefix="v16t-")
+    source = os.path.join(root, "ja.srt")
+    zh = os.path.join(root, "zh.srt")
+    io.open(source, "w", encoding="utf-8").write(
+        "1\n00:00:01,000 --> 00:00:02,000\n%s\n\n" % JA)
+    old_run = pipeline.run_cmd
+    try:
+        pipeline.run_cmd = lambda *a, **k: (
+            5, "SUBTITLE-STUDIO-QUOTA-EXHAUSTED quota=1 untranslated=1/1", "")
+        raised = None
+        try:
+            pipeline.translate(make_cfg(), _QuietLog(), source, zh,
+                               {"system": "s", "context": "", "series": ""})
+        except runtime.EngineError as exc:
+            raised = exc
+        check("额度中止被翻译成看得懂的原因", raised is not None
+              and "额度耗尽" in str(raised), str(raised))
+    finally:
+        pipeline.run_cmd = old_run
+
+
+def case_token_ledger():
+    tr = _load_vendor()
+    old_stats = json.loads(json.dumps(tr.RUN_STATS))
+    try:
+        tr.RUN_STATS["tokens"] = {"input": 0, "output": 0, "reasoning": 0, "total": 0}
+        tr._add_usage({"input_tokens": 100, "completion_tokens": 40,
+                       "reasoning_tokens": 10, "total_tokens": 140})
+        tok = tr.RUN_STATS["tokens"]
+        check("token 账本分清补全与总量",
+              tok["output"] == 40 and tok["total"] == 140 and tok["input"] == 100
+              and tok["reasoning"] == 10, json.dumps(tok))
+        tr.RUN_STATS["tokens"] = {"input": 0, "output": 0, "reasoning": 0, "total": 0}
+        tr._add_usage({"input_tokens": 5, "total_tokens": 7})  # 老形状，无 completion 键
+        check("旧字段形状仍兼容（缺 completion 回退 total）",
+              tr.RUN_STATS["tokens"]["output"] == 7, json.dumps(tr.RUN_STATS["tokens"]))
+    finally:
+        tr.RUN_STATS = old_stats
+
+
+def case_defaults_recalibrated():
+    eng = config_mod.DEFAULTS["engine"]
+    check("引擎默认批量降到 20", eng["batchSize"] == 20, repr(eng["batchSize"]))
+    check("引擎默认 maxTokens 升到 16000", eng["maxTokens"] == 16000,
+          repr(eng["maxTokens"]))
+    tr = _load_vendor()
+    check("vendor 兜底与默认一致",
+          tr.GEN_OPTS["batch_size"] == 20 and tr.GEN_OPTS["max_tokens"] == 16000,
+          json.dumps({k: tr.GEN_OPTS[k] for k in ("batch_size", "max_tokens")}))
+    host = io.open(os.path.join(HERE, "..", "index.js"), encoding="utf-8").read()
+    check("宿主默认同步", "maxTokens: 16000" in host and "batchSize: 20" in host, "")
+    check("宿主的限流识别覆盖中文说法与 token plan",
+          "token plan" in host and "u989d" in host and "u914d" in host, "")
+    client = io.open(os.path.join(HERE, "..", "client.js"), encoding="utf-8").read()
+    check("面板给出可推算的 token 提示",
+          "h.engine.maxTokens" in client and "h.engine.batchSize" in client, "")
+
+
 def main():
     case_events_run()
     case_events_any_output()
@@ -712,6 +1077,19 @@ def main():
     case_mode_switch_keeps_ledger_and_own_output()
     case_record_only_on_success()
     case_plan_wiring_real_dirs()
+    case_quality_ruler()
+    case_quality_ruler_single_source()
+    case_translation_stats_sees_kana()
+    case_quality_gate_raises()
+    case_quota_stops_self_help()
+    case_translate_maps_quota_marker()
+    case_token_ledger()
+    case_defaults_recalibrated()
+    case_quota_body_and_split_stop()
+    case_split_honours_stop_early()
+    case_fallback_quality_is_reachable()
+    case_pipeline_passes_batch_and_tokens()
+    case_quality_gate_precedes_ledger()
     case_config_validation()
     case_defaults_and_host_fields()
     print("\n%d passed, %d failed" % (len(PASSED), len(FAILURES)))

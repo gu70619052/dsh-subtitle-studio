@@ -690,6 +690,23 @@ window.__ModuleLoader__.load({
         'A keychain item name only; the secret itself never enters the config.',
       ],
       'h.engine.temperature': ['范围 0 – 2', 'Range 0 – 2'],
+      'h.engine.batchSize': [
+        '\u4e00\u6279\u9001\u6a21\u578b\u7684\u5b57\u5e55\u6761\u6570\u3002\u5b9e\u6d4b\u7ea6 185 token/\u6761'
+        + '\uff08\u542b\u6a21\u578b\u7231\u56de\u663e\u7684\u53cc\u8bed\uff09\u3002\u6240\u4ee5 20 \u6761\u7ea6 3,700 token\u3002'
+        + '\u8c03\u5927\u4e4b\u524d\u5148\u628a\u300c\u5355\u6b21\u6700\u5927 token\u300d\u4e00\u8d77\u8c03\u5927\u3002',
+        'Blocks per request. Measured ~185 tokens/block (bilingual echo included), '
+        + 'so 20 is about 3,700 tokens. Raise it together with the max-token budget.',
+      ],
+      'h.engine.maxTokens': [
+        '\u5355\u6b21\u56de\u7b54\u7684 token \u4e0a\u9650\uff0c\u8981\u7ed9\u591f\u300c\u8bd1\u6587 + \u601d\u8003\u300d'
+        + '\u4e24\u4efd\uff1a\u601d\u8003\u578b\u6a21\u578b\u5149\u601d\u8003\u5c31\u80fd\u70e7 6,000+\uff0c'
+        + '\u7559\u592a\u5c0f\u4f1a\u622a\u65ad\uff0c\u7f3a\u7684\u6761\u76ee\u4f1a\u81ea\u52a8\u62c6\u5c0f\u6279\u91cd\u95ee'
+        + '\uff08\u591a\u70e7\u989d\u5ea6\uff09\u3002\u4e2d\u8f6c\u4e0a\u9650 16,384\uff0c\u5199\u5927\u4e86\u4e5f\u4f1a\u5939\u5230\u8fd9\u4e2a\u6570\u3002',
+        'Per-call token ceiling. It must cover the translation AND the model thinking: '
+        + 'reasoning models can burn 6,000+ on thinking alone, and a too-small budget '
+        + 'truncates the answer (the engine then re-asks in smaller batches, costing more). '
+        + 'The relay clamps to 16,384.',
+      ],
       'h.engine.reasoningEffort': [
         '截断通常不是模型不行，而是思考把输出预算吃光了。留空 = 跟随 DSH 给这个模型配的默认档位；关掉它，同样的 maxTokens 就能多出正文。',
         'Truncation is usually thinking eating the output budget. Empty follows whatever DSH configured; turning it off leaves more of maxTokens for the body.',
@@ -966,6 +983,94 @@ window.__ModuleLoader__.load({
         ...(extra || {}),
       })
     }
+
+    /* ------------------------------ crash reporting ----------------------------- */
+
+    /**
+     * Report a browser-side crash to the host, which writes it to
+     * logs/host.log. A blank settings page is otherwise invisible: the page
+     * has no console the user can reach, and the host never sees the error.
+     * Never throws — reporting must not break the page it reports about.
+     * @param {string} kind - short bucket, e.g. `render-error`.
+     * @param {any} error - the thrown value.
+     */
+    function reportClientError(kind, error) {
+      const message = String((error && error.message) || error || '').slice(0, 2000)
+      const stack = String((error && error.stack) || '').slice(0, 4000)
+      try {
+        postJson('client-error', { kind: String(kind).slice(0, 40), message, stack })
+      } catch {
+        // The report is best-effort.
+      }
+    }
+
+    // One trap per page: the module may be materialized again when the host
+    // re-activates the plugin, and a second listener would double-report.
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.addEventListener === 'function' &&
+      window.__subtitleStudioErrorTrap !== true
+    ) {
+      window.__subtitleStudioErrorTrap = true
+      window.addEventListener('error', (event) => {
+        reportClientError('window-error', event.error || event.message)
+      })
+      window.addEventListener('unhandledrejection', (event) => {
+        reportClientError('unhandled-rejection', event.reason)
+      })
+    }
+
+    /**
+     * A render-error boundary. React unmounts the whole tree when a component
+     * throws, and the settings page shows an empty column — with a boundary
+     * the failure becomes a readable card instead. The mini-React used by the
+     * panel tests has no class components, so the boundary is inert there and
+     * the panel renders directly.
+     */
+    const ErrorBoundary =
+      typeof React.Component === 'function'
+        ? class PanelErrorBoundary extends React.Component {
+            constructor(props) {
+              super(props)
+              this.state = { error: null }
+            }
+            static getDerivedStateFromError(error) {
+              return { error }
+            }
+            componentDidCatch(error, info) {
+              reportClientError('render-error', error)
+              console.error(`[${NS}] panel render failed`, error, info)
+            }
+            render() {
+              const error = this.state.error
+              if (error === null) return this.props.children
+              const message = String((error && error.message) || error)
+              return h(
+                'div',
+                { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 10 } },
+                h('div', { style: { fontWeight: 600, color: T.error } }, '字幕工坊面板渲染失败'),
+                h('div', { style: { color: T.secondary } }, '错误已写入主机日志（logs/host.log）。'),
+                h(
+                  'pre',
+                  { style: { whiteSpace: 'pre-wrap', fontSize: 12, margin: 0, color: T.label } },
+                  message,
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'ss-btn',
+                    style: S.btn,
+                    onClick: () => {
+                      if (typeof window !== 'undefined') window.location.reload()
+                    },
+                  },
+                  '重新加载页面',
+                ),
+              )
+            }
+          }
+        : null
 
     /** Format a byte count. */
     function humanSize(bytes) {
@@ -1741,6 +1846,43 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const engineKind = String(getAt(draft, 'engine.kind') ?? '')
+      const providerValue = String(getAt(draft, 'engine.provider') ?? '')
+      const modelValue = String(getAt(draft, 'engine.model') ?? '')
+
+      /** 问宿主要这个模型声明的思考档位；问不到就诚实说明，不猜。 */
+      const refreshModelInfo = React.useCallback(async (provider, model) => {
+        if (provider === '' || model === '') {
+          setModelInfo({ efforts: [], defaultEffort: '', error: '', loading: false })
+          return
+        }
+        setModelInfo((previous) => ({ ...previous, loading: true, error: '' }))
+        const response = await api(
+          `model-info?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`,
+        )
+        const payload = response.body && response.body.ok === true ? response.body.data : null
+        if (payload === null || payload === undefined) {
+          setModelInfo({
+            efforts: [],
+            defaultEffort: '',
+            error: (response.body && (response.body.error || response.body.message)) || `HTTP ${response.status}`,
+            loading: false,
+          })
+          return
+        }
+        const efforts = Array.isArray(payload.efforts) ? payload.efforts : []
+        setModelInfo({
+          efforts,
+          defaultEffort: String(payload.defaultEffort ?? ''),
+          error: String(payload.error ?? '') || (efforts.length === 0 ? i18n.t('ov.reasoningUndeclared') : ''),
+          loading: false,
+        })
+      }, [])
+
+      React.useEffect(() => {
+        refreshModelInfo(providerValue, modelValue)
+      }, [refreshModelInfo, providerValue, modelValue])
+
       /** Clear the banner after a while so the panel does not stay noisy. */
       React.useEffect(() => {
         if (banner === null) return undefined
@@ -2207,9 +2349,6 @@ window.__ModuleLoader__.load({
       const modelGroups = (Array.isArray(data.models && data.models.groups) ? data.models.groups : []).filter(
         (group) => Array.isArray(group.models) && group.models.length > 0,
       )
-      const engineKind = String(getAt(draft, 'engine.kind') ?? '')
-      const providerValue = String(getAt(draft, 'engine.provider') ?? '')
-      const modelValue = String(getAt(draft, 'engine.model') ?? '')
       // 档位清单是模型自己的，选完模型才知道；手填也是合法路径（有些模型
       // 不在本地 catalog 里，宿主问不出清单）。
       const REASONING_FREE = '__free__'
@@ -2293,38 +2432,6 @@ window.__ModuleLoader__.load({
         })
       }
 
-      /** 问宿主要这个模型声明的思考档位；问不到就诚实说明，不猜。 */
-      const refreshModelInfo = React.useCallback(async (provider, model) => {
-        if (provider === '' || model === '') {
-          setModelInfo({ efforts: [], defaultEffort: '', error: '', loading: false })
-          return
-        }
-        setModelInfo((previous) => ({ ...previous, loading: true, error: '' }))
-        const response = await api(
-          `model-info?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}`,
-        )
-        const payload = response.body && response.body.ok === true ? response.body.data : null
-        if (payload === null || payload === undefined) {
-          setModelInfo({
-            efforts: [],
-            defaultEffort: '',
-            error: (response.body && (response.body.error || response.body.message)) || `HTTP ${response.status}`,
-            loading: false,
-          })
-          return
-        }
-        const efforts = Array.isArray(payload.efforts) ? payload.efforts : []
-        setModelInfo({
-          efforts,
-          defaultEffort: String(payload.defaultEffort ?? ''),
-          error: String(payload.error ?? '') || (efforts.length === 0 ? i18n.t('ov.reasoningUndeclared') : ''),
-          loading: false,
-        })
-      }, [])
-
-      React.useEffect(() => {
-        refreshModelInfo(providerValue, modelValue)
-      }, [refreshModelInfo, providerValue, modelValue])
 
       const testReady = modelValue !== '' && (engineKind !== 'dsh' || providerValue !== '')
 
@@ -3552,7 +3659,7 @@ window.__ModuleLoader__.load({
       const issueCount = Object.keys(localErrors).length
 
       ensureScopedStyle()
-      return h(
+      const tree = h(
         'div',
         { style: S.root, 'data-dsh-subtitle-studio': '' },
         h(
@@ -3586,6 +3693,18 @@ window.__ModuleLoader__.load({
           data.configPath ? h('code', { style: S.code }, data.configPath) : null,
         ),
       )
+      return tree
+    }
+
+    /**
+     * What the settings slot actually renders. The boundary must be Panel's
+     * PARENT: React only catches errors thrown below the boundary, and the
+     * v1.6.0 blank page was Panel itself throwing (a hook called after an
+     * early return → "Rendered more hooks than during the previous render"),
+     * which a boundary inside Panel's own output could never see.
+     */
+    function StudioSettings(props) {
+      return ErrorBoundary === null ? h(Panel, props) : h(ErrorBoundary, null, h(Panel, props))
     }
 
     /* ----------------------------------- apply -------------------------------- */
@@ -3619,11 +3738,11 @@ window.__ModuleLoader__.load({
             order: 50,
             label: () => i18n.t('nav'),
           },
-          Panel,
+          StudioSettings,
         ),
       )
     }
 
-    return { apply, inject }
+    return { apply, inject, __subtitleStudio: { Panel, StudioSettings, ErrorBoundary } }
   },
 })

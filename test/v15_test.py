@@ -94,7 +94,7 @@ class FakeBridge(object):
 def reset_stats():
     translate_srt.RUN_STATS.update({
         "primary": 0, "split": 0, "truncated": 0, "failed": 0,
-        "tokens": {"input": 0, "output": 0, "reasoning": 0}, "untranslated": [],
+        "tokens": {"input": 0, "output": 0, "reasoning": 0, "total": 0}, "untranslated": [],
     })
 
 
@@ -269,12 +269,46 @@ def case_bridge_error_classification():
             check("档位被拒时错误码原样传到引擎", meta.get("code") == "unknown-effort", json.dumps(meta))
             check("档位被拒不重试（只问一次）", len(attempts) == 1, str(len(attempts)))
 
+            # v1.6.1（REQ-62）改判：上游额度不会等 20 秒就自己恢复，
+            # 重试 + 拆批只是把同一堵墙多撞几次，所以一次都不再问。
+            attempts[:] = []
+            translate_srt.STOP_EARLY = False
+            urllib.request.urlopen = make_error(429, json.dumps({
+                "ok": False, "code": "upstream-rate-limit", "error": "slow down"}))
+            text, meta = translate_srt._call_dsh_bridge("sys", "user", "fake-provider", "fake-model")
+            check("上游额度（429 upstream-rate-limit）不再重试",
+                  len(attempts) == 1, str(len(attempts)))
+            check("上游额度算确定性失败（不触发拆批自救）",
+                  meta.get("fatal") is True and meta.get("code") == "upstream-rate-limit",
+                  json.dumps(meta))
+            check("上游额度置早停位", translate_srt.STOP_EARLY is True,
+                  repr(translate_srt.STOP_EARLY))
+            check("上游额度计入 quota 账", translate_srt.RUN_STATS["quota"] >= 1,
+                  str(translate_srt.RUN_STATS["quota"]))
+            translate_srt.STOP_EARLY = False
+
+            # 宿主自己的闸门（每分钟预算 / 并发）等 60 秒就恢复，绝不能中止整轮
+            # —— 审计 r16d-quality D-P1 指出这两种 429 早先被混为一谈。
             attempts[:] = []
             urllib.request.urlopen = make_error(429, json.dumps({
-                "ok": False, "code": "rate-limited", "error": "slow down"}))
+                "ok": False, "code": "local-budget", "error": "per-minute budget"}))
             text, meta = translate_srt._call_dsh_bridge("sys", "user", "fake-provider", "fake-model")
-            check("限流（429）会重试", len(attempts) == 3, str(len(attempts)))
-            check("限流重试到底后如实报告不可达", meta.get("fatal") is False, json.dumps(meta))
+            check("本地闸门 429 走退避重试而不是中止",
+                  len(attempts) == 3, str(len(attempts)))
+            check("本地闸门不置早停位", translate_srt.STOP_EARLY is False,
+                  repr(translate_srt.STOP_EARLY))
+            check("本地闸门耗尽重试后是可恢复失败不是额度",
+                  meta.get("fatal") is False and meta.get("code") == "local-throttled",
+                  json.dumps(meta))
+
+            # 不给 code 的裸 429（旧宿主/别的中转）同样按可恢复处理
+            attempts[:] = []
+            urllib.request.urlopen = make_error(429, "Too Many Requests")
+            text, meta = translate_srt._call_dsh_bridge("sys", "user", "fake-provider", "fake-model")
+            check("裸 429（无 code）不中止整轮",
+                  translate_srt.STOP_EARLY is False and meta.get("fatal") is False,
+                  json.dumps(meta))
+            translate_srt.STOP_EARLY = False
         finally:
             urllib.request.urlopen = original
             translate_srt.time.sleep = old_sleep

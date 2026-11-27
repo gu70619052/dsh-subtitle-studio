@@ -267,6 +267,7 @@ def rerun_batch(batch, api_key, model="MiniMax-M3", engine="minimax", provider="
 def _rerun_batch_dsh(batch, model, provider, timeout):
     """经 DSH 宿主中转重跑一批（凭据在 DSH 那边，引擎只发文本）。"""
     try:
+        import translate_srt as _ts
         from translate_srt import _call_dsh_bridge
     except ImportError as exc:
         return {}, "translate_srt 不可用: %s" % exc
@@ -379,6 +380,7 @@ def _rerun_batch_ollama(batch, model, timeout):
         return {}
 
 def main():
+    import translate_srt as _ts   # 额度早停位（REQ-62）看它的实时值
     p = argparse.ArgumentParser()
     p.add_argument("src_srt", help="原始 src.srt 路径")
     p.add_argument("zh_srt", help="已经翻译过的 zh.srt 路径")
@@ -463,6 +465,10 @@ def main():
     batch_failures = []  # v2.16: 收集失败信息, 最后统一报告 (不再静默吞)
     engine_used_count = {}  # 统计主用引擎 vs fallback
     for i, batch in enumerate(batches, 1):
+        if _ts.STOP_EARLY:
+            # 额度耗尽（REQ-62）：剩余批不再发问，未译的保留原文交给质量门
+            print(f"  ❗ 额度耗尽，剩余 {len(batches) - i + 1} 批不再重跑", flush=True)
+            break
         result, engine_used, err = rerun_batch(batch, api_key, args.model,
                                                engine=args.engine, provider=args.provider)
         new_records.update(result)

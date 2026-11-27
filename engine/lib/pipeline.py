@@ -32,8 +32,11 @@ from lib.runtime import (EngineError, Log, age_days, atomic_write_json, atomic_w
 VENDOR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor")
 PYTHON = sys.executable or "python3"
 
-PLACEHOLDER_RE = re.compile(r"^\[(听不清|广告宣番|♪ 歌词 ♪)\]$")
-KANA_RE = re.compile(r"[\u3040-\u30ff]")
+# 未译判定只有一份实现，vendor 与流水线共用（REQ-61）：老口径「含汉字就算
+# 译好」会被日文汉字骗过 —— 整片没译也只报 2.5%。
+from lib import quality
+PLACEHOLDER_RE = quality.PLACEHOLDER_RE
+KANA_RE = quality.KANA_RE
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 MAX_SRT_BLOCK_SECONDS = 30.0
@@ -331,17 +334,13 @@ def escape_filter_path(path):
 
 
 def translation_stats(zh_path):
+    """产物质量账本。判定口径与 vendor 完全一致（lib/quality.py）。"""
     blocks = parse_srt_file(zh_path)
-    untranslated = 0
-    for block in blocks:
-        text = (block.get("text") or "").strip()
-        if not text:
-            continue
-        if KANA_RE.search(text) and not PLACEHOLDER_RE.match(text):
-            untranslated += 1
-    total = len(blocks) or 1
+    counts = quality.stats(block.get("text") or "" for block in blocks)
+    untranslated = counts["untranslated"]
     stats = {"blocks": len(blocks), "untranslated": untranslated,
-             "untranslatedPct": round(untranslated * 100.0 / total, 2)}
+             "untranslatedPct": counts["untranslatedPct"],
+             "suspect": counts["suspect"], "suspectPct": counts["suspectPct"]}
     # translate_srt 会在产物旁边留一份自救账本；有就并进来，没有就保持旧形状。
     try:
         with open(zh_path + ".report.json", "r", encoding="utf-8") as handle:
@@ -352,6 +351,7 @@ def translation_stats(zh_path):
         stats["calls"] = detail.get("calls") or {}
         stats["truncatedBatches"] = detail.get("truncatedBatches") or 0
         stats["failedBatches"] = detail.get("failedBatches") or 0
+        stats["quotaHits"] = detail.get("quotaHits") or 0
         stats["tokens"] = detail.get("tokens") or {}
         if detail.get("reasoningEffort"):
             stats["reasoningEffort"] = detail["reasoningEffort"]
@@ -684,7 +684,7 @@ def translate(cfg, log, source_srt, zh_srt, prompt_set):
     else:
         system_file = None
 
-    build = cfg.get("engine.batchSize") or 30
+    build = cfg.get("engine.batchSize") or 20
     block_count = len(parse_srt_file(source_srt))
     batches = count_batches(block_count, int(build))
     timeout = max(600, int(cfg.get("engine.timeoutSeconds") or 300) * batches + 300)
@@ -719,8 +719,13 @@ def translate(cfg, log, source_srt, zh_srt, prompt_set):
                 model_for_engine(cfg), timeout))
     rc, out, err = run_cmd(cmd, timeout=timeout, env=engine_env(cfg))
     if rc != 0:
-        raise EngineError(5, "翻译引擎调用失败（rc=%s）" % rc,
-                          detail=(err or out).strip()[-1200:])
+        tail = (err or out).strip()[-1200:]
+        if "SUBTITLE-STUDIO-QUOTA-EXHAUSTED" in (out or "") + (err or ""):
+            # 上游按额度挡了（REQ-62）：继续跑只会把剩下的批次白烧一遍，
+            # 直接把「等额度恢复或换模型」说清楚，别让人以为在正常工作。
+            raise EngineError(5, "模型额度耗尽（上游限流），本轮已中止翻译",
+                              detail=tail)
+        raise EngineError(5, "翻译引擎调用失败（rc=%s）" % rc, detail=tail)
     if not file_size(zh_srt):
         raise EngineError(5, "翻译输出为空：%s" % os.path.basename(zh_srt),
                           detail=(err or "").strip()[-500:])
@@ -763,7 +768,7 @@ def quality_gate(cfg, log, source_srt, zh_srt, series=""):
            source_srt, zh_srt, zh_srt,
            "--engine", engine_kind_for_vendor(cfg),
            "--model", model_for_engine(cfg),
-           "--batch-size", str(cfg.get("engine.batchSize") or 30)]
+           "--batch-size", str(cfg.get("engine.batchSize") or 20)]
     if cfg.get("engine.kind") == "dsh":
         cmd += ["--provider", provider_for_engine(cfg)]
     if series:
@@ -774,6 +779,19 @@ def quality_gate(cfg, log, source_srt, zh_srt, series=""):
     final = translation_stats(zh_srt)
     log.info("重跑后未译率 %.1f%%（%d 条）"
              % (final["untranslatedPct"], final["untranslated"]))
+    # REQ-61：以前这里只打日志，未译 100% 也照样压片、上传、记账、发成功
+    # 通知。超阈值就判失败 —— 抛出在上传与台账之前，所以这部片下次还会重试。
+    # 判失败只看比例：条数阈值（默认 50）已经用来决定「要不要逐条重跑」，
+    # 再拿它当失败线会让长片因为几十条残留而整片不交付。
+    if final["untranslatedPct"] > pct_threshold:
+        raise EngineError(
+            5, "译文质量不达标：未译 %d/%d（%.1f%%），阈值 %.1f%% / %d 条，"
+               "逐条重跑后仍未过" % (final["untranslated"], final["blocks"],
+                                    final["untranslatedPct"], pct_threshold,
+                                    count_threshold),
+            detail="未译样本：%s；嫌疑（无汉字无假名）%d 条" % (
+                "、".join(final.get("untranslatedIds") or []),
+                final.get("suspect") or 0))
     return final
 
 

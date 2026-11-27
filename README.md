@@ -137,7 +137,7 @@ mid-answer. This build treats that as data, not as a failed call:
   (leave it on *follow the model's default* and the key is not sent at all);
 - a level the model does not have is refused *before* the request is billed
   (`422 unknown-effort`), and a provider that is throttling says so
-  (`429 rate-limited`) instead of arriving as a generic error;
+  (`429 upstream-rate-limit`) instead of arriving as a generic error;
 - the relay returns the text that was written before the cut, with
   `usage.reasoningTokens` telling you how much of the budget went to thinking;
 - the translator keeps every block it can match by timestamp and re-asks only the
@@ -145,6 +145,30 @@ mid-answer. This build treats that as data, not as a failed call:
 - what still cannot be translated keeps the source line, and each run writes
   `<output>.report.json` (calls, split retries, truncated/failed batches, token
   split, untranslated ids) which the run result and the notification surface too.
+
+Beyond a single batch, three round-level rules apply:
+
+- **A quota that is used up stops the round.** "Usage ceiling reached" replies are
+  recognised in English and Chinese and answered as `429 upstream-rate-limit`; the engine
+  does not retry them and does not split the batch — waiting twenty seconds does
+  not refresh a plan allowance, and the old behaviour spent 24 extra calls and
+  almost six minutes against the same wall. Remaining blocks keep their source
+  text and the run ends with a clear "quota exhausted" error.
+- **Untranslated means untranslated.** One ruler (`engine/lib/quality.py`) is used
+  by the translator and the pipeline: any kana in a line counts as not translated
+  — Japanese is written largely in Chinese characters, so "the first line has no
+  Chinese" once read a wholly untouched film as "2.5% untranslated ✅". A line with
+  neither kana nor kanji is reported as a suspect but never fails a run, so a
+  glossary term kept in Japanese is not a defect.
+- **A bad round is not remembered as a good one.** If the untranslated share is
+  still over `translation.rerunThresholdPct` after the per-block retry, the round
+  fails *before* uploading and before the `translated.json` entry is written, so
+  the next round tries that file again instead of skipping it forever.
+
+Default sizing follows the measurement: `engine.batchSize` 20 and
+`engine.maxTokens` 16000 — roughly 185 completion tokens per block, plus whatever a
+thinking model spends on reasoning (6,000+ is normal), against a relay ceiling of
+16,384. Both fields state that arithmetic in the panel.
 
 ## Data and privacy
 
@@ -233,13 +257,13 @@ run: the engine logs one line and translates without it.
 node --check index.js && node --check client.js   # syntax
 python3 -m compileall -q engine                   # syntax
 cd test
-node e2e.mjs                                      # host bridge + relay + one-click installs, 169 checks
+node e2e.mjs                                      # host bridge + relay + one-click installs, 173 checks
 python3 multi_dir_test.py                         # multi-directory engine, 29 checks
 python3 quality_test.py                           # line wrapping, audio, scheduler symmetry, 25 checks
 python3 v14_test.py                               # timeline alignment, anti-hallucination, styles, output mode, ffmpeg resolution, 85 checks
 python3 v15_test.py                               # reasoning effort, truncated batches, split retries, error classification, 30 checks
 python3 v16_test.py                               # notification modes, translated ledger, own-output detection, 93 checks
-node ui-smoke.mjs                                 # panel render, locale re-activation, reasoning picker, first-run checklist, 161 checks
+node ui-smoke.mjs                                 # panel render, locale re-activation, hook-order guard, first-run checklist, 167 checks
 node real-smoke.mjs                               # real engine against a fake HOME, 22 checks
 bash release-gate.sh                              # publish checklist: privacy greps, syntax,
 #   docs, then every suite above. Exit 0 means publishable.

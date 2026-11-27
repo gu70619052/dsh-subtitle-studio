@@ -4,6 +4,90 @@ All dates are the day the release was tagged. Config keys added by a release kee
 working on older files: everything is deep-merged over defaults, so an upgrade
 never needs a migration step.
 
+## v1.6.1
+
+- **Fix: the settings section rendered as a blank page.** `Panel` called a
+  `useCallback` and a `useEffect` *after* its two early returns — the first paint
+  showed the loading state and hooked one fewer time than the render that
+  followed, so React threw `Rendered more hooks than during the previous
+  render` (error #310) and unmounted the whole section. Every hook now runs
+  before the first return, and the values those hooks need (`engine.kind` /
+  `engine.provider` / `engine.model`, and the `model-info` lookup they drive)
+  moved up with them.
+- **New: a rendering failure is a readable card, not a blank column.** The
+  settings slot now mounts the panel *behind* an error boundary, which reports
+  the error to the host (`POST client-error` → `logs/host.log`, home directory
+  folded to `~`) and shows the message with a reload button. A boundary inside
+  the panel could never catch the panel throwing, which is exactly what
+  v1.6.0 did.
+- **New: uncaught client errors are logged too.** `window.onerror` and
+  `unhandledrejection` go to the same route, so a crash in any handler leaves a
+  trace instead of a silent no-op.
+- **Testing: the panel harness now enforces React's hook rules.** The mini-React
+  used by `test/ui-smoke.mjs` silently tolerated object children, `undefined`
+  returns and changed hook order — the three ways this bug stayed invisible
+  while 161 checks passed. All three now throw exactly like React, and two
+  regression pins cover the order change (a synthetic shifting component and a
+  source-order assertion on `Panel`).
+- **Fix: an untranslated film no longer reports itself as translated.** The
+  inline quality count asked "does the first line contain no Chinese", and
+  Japanese is written largely in Chinese characters — a round that delivered 118
+  source lines untouched printed `untranslated 3/118 = 2.5% ✅` and exited 0.
+  `engine/lib/quality.py` is now the single ruler, shared by the translator and
+  the pipeline: any kana counts as untranslated, text with neither kana nor
+  kanji is a suspect that is reported but never fails the run. Measured against
+  2,404 real blocks: one false positive (a correct line keeping a Japanese
+  nickname), zero misses — and it revealed that ~19% of the user's own two
+  episodes had never been translated, which the panel had never once said.
+- **New: a failed quality gate fails the run.** Past the threshold the round now
+  raises *before* uploading and before `state/translated.json` is written, so a
+  bad round is retried instead of being remembered as done. Thresholds are
+  unchanged (`translation.rerunThresholdPct`, default 5).
+- **Fix: an exhausted quota stops asking.** Upstream replies such as
+  「已达到 Token Plan 用量上限」 arrive through the relay as an ordinary 502, so the
+  engine retried each batch three times and then split it 24 more ways — nearly
+  six minutes hammering the same wall. The relay now recognises the English and
+  Chinese wording as rate limiting and answers `429 upstream-rate-limit`; the engine
+  treats that as terminal, leaves the remaining blocks on their source text and
+  ends the run with a clear "quota exhausted" error.
+- **Fix: the token ledger reported the wrong thing.** The sidecar's `output`
+  field carried the upstream `total_tokens` (prompt included), so any budget
+  sized from it came out ~35% high. `output` is now the completion, `total` is
+  prompt + completion, and the old key names stay for the panel and notices.
+- **Change: defaults recalibrated to what a round actually costs** —
+  `engine.batchSize` 30 → 20 and `engine.maxTokens` 8000 → 16000. Measured on a
+  118-block file: ~185 completion tokens per block, so a 30-block batch needs
+  ~5,500 before a reasoning model adds 6,000+ of thinking on top and cuts the
+  batch mid-write. The panel hints show that arithmetic; the relay ceiling is
+  16,384 and larger values are clamped, not rejected.
+- **Fix: the plugin's own 429 no longer wears the quota wall's clothes.** The
+  per-minute spend gate answered `429 rate-limited`, identical to an exhausted
+  upstream quota, so hitting one's own budget aborted the whole round — a
+  regression the quota fix would have introduced. The two are now spelled
+  `local-budget` / `busy` (retry with a backoff, the round continues) versus
+  `upstream-rate-limit` (stop the round), and a check asserts the two codes
+  differ. `rate-limited` is still accepted as a backoff answer for older hosts.
+- **Fix: half-width katakana counted as Chinese.** The kana class covered only
+  U+3040–U+30FF, so an ASR pass emitting ﾂｶﾅ degraded to a suspect and
+  under-counted untranslated lines. Half-width katakana U+FF66–FF9F is now
+  included, while U+3131–U+318E (Hangul, which sits inside the naive range) and
+  the interpunct U+30FB (used in Chinese text too) stay excluded.
+- **Fix: the early stop reached the second-pass scripts too.**
+  `retry_translate.py` and `prefilter_and_rerun.py` looped over batches without
+  consulting the quota flag, and the batch-splitting loop kept asking for the
+  second half after the first hit the wall. All of them now leave the remaining
+  blocks on their source text.
+- **Fix: the Ollama branch of the token ledger** reported only
+  `total_tokens = eval_count`, so the completion/total split REQ-63 introduced
+  held for the DSH relay only; `eval_count` and `prompt_eval_count` are now
+  recorded as completion and prompt respectively.
+- **Testing: five coverage holes closed** (audit r16d-tests): a quota reported
+  in a 200 body, the early stop inside the splitting loop, the shared-module
+  loss path that silently left the fallback copy unused, `--batch-size` /
+  `--max-tokens` actually reaching the translator's argv, and the ordering
+  contract that a failed quality gate must precede `record_translated`. The
+  two `stats()` implementations now accept the same input shapes.
+
 ## v1.6.0
 
 - **New: the plugin remembers what it has already translated.** Until now

@@ -183,7 +183,9 @@ relayed instead:
    returning the assembled text. A stream that never reports a finish reason, or that is cut off by the 240-second
    wall clock, is reported as a failure. Provider failures come back as `502` with the provider's message.
 4. Two budgets bound the relay: at most 2 calls may be in flight (`429 busy`) and at most 120 per minute
-   (`429 rate-limited`). `SUBTITLE_STUDIO_RELAY_MAX_TOKENS`, `SUBTITLE_STUDIO_RELAY_CONCURRENCY` and
+   (`429 local-budget`). These are the plugin's OWN gates, which clear within a minute — they are
+   deliberately spelled differently from an exhausted upstream quota, because the engine picks
+   "back off and retry" versus "stop the round" from that code alone. `SUBTITLE_STUDIO_RELAY_MAX_TOKENS`, `SUBTITLE_STUDIO_RELAY_CONCURRENCY` and
    `SUBTITLE_STUDIO_SPEND_LIMIT` override them and are read per request.
 5. `POST /api/dsh-subtitle-studio/model-test` is the panel's `Test model` button. It needs no token, is bounded by the
    same Host gate and the same per-minute budget, and clamps `maxTokens` to 256, so it is not a free generation
@@ -361,6 +363,31 @@ the budget. Three things changed so a run does not quietly lose it:
    `translation_stats()` merges it into the run result, and the completion
    notification appends the untranslated ids, so a low-quality round comes with a
    list instead of a percentage.
+   `output` in that ledger is the **completion** (a thinking model's reasoning is
+   inside it); `total` is prompt + completion. The field used to carry the upstream
+   `total_tokens`, so anyone sizing `maxTokens` from it over-counted by a third.
+
+Two further hard rules came out of measuring on 2026-11-27:
+
+4. **An exhausted quota stops the round** — and only an exhausted quota. The code is
+   `429 upstream-rate-limit`; the plugin's own `local-budget` / `busy` answers are retried with a
+   backoff instead of ending the run. When the upstream says something like
+   "Token Plan usage ceiling reached", the relay normalises it to
+   `429 rate-limited` (English wording, Chinese wording, or a bare `429`), and the
+   engine neither retries nor splits the batch — quota does not refresh in twenty
+   seconds, and the old path hit the same wall 24 extra times across nearly six
+   minutes. The remaining blocks keep their source text, the round fails with
+   "quota exhausted", and the notification says so.
+5. **One ruler for "untranslated", and it can fail the run.** `engine/lib/quality.py`
+   is the only implementation: any kana means untranslated (Japanese itself is full
+   of kanji, so the old "first line has no Chinese" test read a wholly untranslated
+   file as "2.5% untranslated ✅"); text with neither kana nor kanji is only a
+   suspect, reported but never a failure. The pipeline applies this gate before
+   uploading, so an over-threshold round fails **without writing the translated
+   ledger** and retries next time. Defaults moved to 20 blocks / 16,000 tokens
+   (measured ~185 tokens per block; a reasoning model can burn 6,000+ on thinking
+   alone, and the relay clamps at 16,384), and the panel states that arithmetic in
+   the field hints.
 
 Two failure shapes get their own answer instead of a generic error:
 
@@ -373,7 +400,8 @@ Two failure shapes get their own answer instead of a generic error:
   picker, and says which levels the model does have.
 - **The provider is throttling.** A quota used to arrive as a plain `502`, so the
   engine waited a couple of seconds and asked again. It now arrives as
-  `429 rate-limited`, which the engine retries with the long backoff (20s, 40s,
+  `429 upstream-rate-limit`, which the engine answers by stopping the round (see item 4) instead
+  of retrying with the long backoff (20s, 40s,
   60s) instead of the short one.
 
 ## Known limits

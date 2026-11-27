@@ -115,8 +115,8 @@ def _strip_bilingual(text):
 GEN_OPTS = {
     "temperature": float(os.environ.get("SUBTITLE_TEMPERATURE") or 0.1),
     "seed": int(os.environ.get("SUBTITLE_SEED") or 42),
-    "max_tokens": int(os.environ.get("SUBTITLE_MAX_TOKENS") or 8000),
-    "batch_size": int(os.environ.get("SUBTITLE_BATCH_SIZE") or 30),
+    "max_tokens": int(os.environ.get("SUBTITLE_MAX_TOKENS") or 16000),
+    "batch_size": int(os.environ.get("SUBTITLE_BATCH_SIZE") or 20),
     "ollama_host": os.environ.get("SUBTITLE_OLLAMA_HOST") or "http://127.0.0.1:11434",
     # 思考档位：留空 = 不告诉模型任何档位，跟随它在 DSH 里的默认。
     # 合法取值是每个模型自己的元数据，面板从宿主问出来再给你选。
@@ -128,9 +128,102 @@ SPLIT_MAX_DEPTH = 3
 SPLIT_MAX_CALLS = 24
 SPLIT_MIN_SIZE = 2
 # 每轮运行的自救统计，最后写进 .report.json 供上层与通知使用。
+# quota = 被上游按额度/限流挡下的次数；一出现就整轮早停（REQ-62），
+# 因为「Token Plan 用量上限」不会等 20 秒就自己恢复，拆批重问只是空转。
 RUN_STATS = {"primary": 0, "split": 0, "truncated": 0, "failed": 0,
-             "tokens": {"input": 0, "output": 0, "reasoning": 0},
+             "quota": 0,
+             "tokens": {"input": 0, "output": 0, "reasoning": 0, "total": 0},
              "untranslated": []}
+
+# 额度耗尽置位后，所有发问循环都要让路：main 的批次循环、拆批自救、
+# _retrain_with_engine，以及 retry_translate / prefilter_and_rerun 两条二次翻译脚本。
+STOP_EARLY = False
+
+
+def _quota_hit(code):
+    """把「再问也不会有额度」的错误记下来并置早停位。"""
+    global STOP_EARLY
+    RUN_STATS["quota"] += 1
+    STOP_EARLY = True
+    return {"fatal": True, "code": code or "rate-limited",
+            "total_tokens": 0, "input_tokens": 0, "reasoning_tokens": 0}
+
+
+# 质量判定只有一份实现（lib/quality.py）。不往 sys.path 里塞 engine/lib ——
+# 那目录的 select.py 会遮蔽标准库 select，subprocess→selectors 会拿到错模块
+# 并把异常吞成假结果；插包根 engine/ 才安全（与 bilingual_ass.py 同一写法）。
+try:
+    from lib import quality as _quality  # noqa: F401  作为包跑时直接可用
+except ImportError:  # 独立脚本执行：补包根再试
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        from lib import quality as _quality
+    except Exception:  # noqa: BLE001  共享模块丢了也不能让翻译整段挂掉
+        _quality = None
+
+# 兜底副本，规则与 lib/quality.py 逐字对齐（v16_test 钉住等价）。定义在
+# 模块级而不是 if 里面，是为了让等价性真的可测——否则「共享模块丢了」这条
+# 路径在测试里永远走不到。
+import re as _re
+
+class _FallbackQuality(object):
+    # 与 lib/quality.py 同步：半角假名算假名，中黒 U+30FB 不算。
+    KANA_RE = _re.compile(
+        "[\\u3041-\\u309f\\u30a1-\\u30fa\\u30fc-\\u30ff\\u31f0-\\u31ff\\uff66-\\uff9f]"
+    )
+    IDEOGRAPH_RE = _re.compile("[一-鿿]")
+    PLACEHOLDER_RE = _re.compile("^\\[(听不清|广告宣番|♪ 歌词 ♪)\\]$")
+
+    @staticmethod
+    def classify(text):
+        body = (text or "").strip()
+        if not body:
+            return "empty"
+        if _FallbackQuality.PLACEHOLDER_RE.match(body):
+            return "placeholder"
+        if _FallbackQuality.KANA_RE.search(body):
+            return "untranslated"
+        if _FallbackQuality.IDEOGRAPH_RE.search(body):
+            return "translated"
+        return "suspect"
+
+    @staticmethod
+    def stats(lines, id_key=None):
+        # 签名与 lib/quality.stats 一致：lines 可以是纯文本序列，也可以是
+        # (标识, 文本) 序列。忽略 id_key 会让副本在元组入参上直接抛
+        # AttributeError（tuple 没有 .strip），两份实现必须同形。
+        total = untranslated = suspect = 0
+        uid = []
+        sid = []
+        for pos, item in enumerate(lines):
+            # 与 lib/quality.stats 同形：字符串或 (标识, 文本) 都接受
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                ident, text = item[0], item[1]
+            else:
+                text, ident = item, pos
+            total += 1
+            kind = _FallbackQuality.classify(text)
+            if kind == "untranslated":
+                untranslated += 1
+                uid.append(ident)
+            elif kind == "suspect":
+                suspect += 1
+                sid.append(ident)
+        denom = total or 1
+        return {"total": total, "untranslated": untranslated, "suspect": suspect,
+                "untranslatedPct": round(untranslated * 100.0 / denom, 2),
+                "suspectPct": round(suspect * 100.0 / denom, 2),
+                "untranslatedIds": uid[:80], "suspectIds": sid[:80]}
+
+    @staticmethod
+    def verdict(counts, fail_pct, fail_count):
+        return (counts["untranslatedPct"] > fail_pct
+                or counts["untranslated"] > fail_count)
+
+
+# 共享模块在就用共享模块；丢了退回兜底副本，翻译不能因此整段挂掉。
+if _quality is None:
+    _quality = _FallbackQuality
 
 def format_time(sec):
     if sec < 0: sec = 0
@@ -268,6 +361,12 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
                    "bad-content-type", "payload-too-large", "invalid-request",
                    "unknown-provider", "unknown-model", "bad-request",
                    "token-limit", "unknown-effort"}
+    # 真·额度耗尽：按套餐周期计，等 20 秒不会自己恢复，继续拆批只会把一轮
+    # 跑成几十次白烧的调用（REQ-62）→ 置早停位。
+    quota_codes = {"upstream-rate-limit", "insufficient-quota"}
+    # 宿主自己的闸门（每分钟调用预算 / 并发上限）也是 429，但它 ≤60s 就恢复。
+    # 把它当额度耗尽会整轮中止，比原来的空转更糟 → 只退避重试（审计 r16d-quality D）。
+    backoff_codes = {"local-budget", "busy", "rate-limited"}
     for attempt in range(3):
         try:
             request = urllib.request.Request(url, data=data, headers=headers)
@@ -276,8 +375,13 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
             if body.get("ok"):
                 data_block = body.get("data") or {}
                 usage = data_block.get("usage") or {}
+                # 注意键名：DSH 的 outputTokens 就是补全量（思考模型里含思考），
+                # 老代码把它塞进 total_tokens，读代码的人以为那是 prompt+completion，
+                # 于是拿它去标定 maxTokens 会算高（REQ-63）。
                 meta = {
-                    "total_tokens": int(usage.get("outputTokens") or 0),
+                    "completion_tokens": int(usage.get("outputTokens") or 0),
+                    "total_tokens": int(usage.get("outputTokens") or 0)
+                    + int(usage.get("inputTokens") or 0),
                     "input_tokens": int(usage.get("inputTokens") or 0),
                     "reasoning_tokens": int(usage.get("reasoningTokens") or 0),
                     "truncated": body.get("truncated") is True,
@@ -299,10 +403,14 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
             code = str(body.get("code") or "")
             message = str(body.get("error"))[:200]
             print("    ⚠️ DSH 调用失败: %s" % message, flush=True)
+            if code in quota_codes:
+                print("    ↳ 额度耗尽（%s），本轮不再重试也不再拆批" % code, flush=True)
+                return None, _quota_hit(code)
             if code in fatal_codes or "is required" in message or "unknown" in code:
                 print("    ↳ 配置类错误，不再重试", flush=True)
                 return None, {"fatal": True, "code": code or "config-error",
-                              "total_tokens": 0, "reasoning_tokens": 0}
+                              "total_tokens": 0, "input_tokens": 0,
+                              "reasoning_tokens": 0}
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
@@ -317,13 +425,26 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
                 relay_code = str((json.loads(detail) or {}).get("code") or "")
             except Exception:  # noqa: BLE001
                 relay_code = ""
+            if relay_code in quota_codes:
+                print("    ↳ 额度耗尽（%s），本轮不再重试也不再拆批" % relay_code,
+                      flush=True)
+                return None, _quota_hit(relay_code)
             if relay_code and relay_code in fatal_codes:
                 print("    ↳ 配置类错误，不再重试", flush=True)
                 return None, {"fatal": True, "code": relay_code,
-                              "total_tokens": 0, "reasoning_tokens": 0}
-            if exc.code == 429:
-                time.sleep(20 + attempt * 20)
-                continue
+                              "total_tokens": 0, "input_tokens": 0,
+                              "reasoning_tokens": 0}
+            if relay_code in backoff_codes or exc.code == 429:
+                # 到这里的 429 是宿主本地闸门（预算/并发），等得起；裸 429
+                # （旧宿主不给 code）也按可恢复处理，别把整轮掐掉。
+                print("    ↳ 宿主侧限流（%s），等 %d 秒后重试本批"
+                      % (relay_code or "HTTP 429", 20 + attempt * 20), flush=True)
+                if attempt < 2:
+                    time.sleep(20 + attempt * 20)
+                    continue
+                return None, {"fatal": False, "code": "local-throttled",
+                              "total_tokens": 0, "input_tokens": 0,
+                              "reasoning_tokens": 0}
             if 400 <= exc.code < 500:
                 print("    ↳ 请求本身被拒绝，不再重试", flush=True)
                 return None, {"fatal": True, "code": relay_code or ("rejected-%d" % exc.code),
@@ -333,7 +454,7 @@ def _call_dsh_bridge(system, user_prompt, provider, model):
         if attempt < 2:
             time.sleep(2 + attempt * 2)
     return None, {"fatal": False, "code": "unreachable",
-                  "total_tokens": 0, "reasoning_tokens": 0}
+                  "total_tokens": 0, "input_tokens": 0, "reasoning_tokens": 0}
 
 
 def _call_ollama(system, user_prompt, model):
@@ -369,8 +490,14 @@ def _call_ollama(system, user_prompt, model):
             d = json.loads(r.stdout)
             output = d.get("response", "").strip()
             if output:
-                eval_count = d.get("eval_count", 0)
-                return output, {"total_tokens": eval_count}
+                # ollama 把补全与输入分开报：eval_count 是补全，
+                # prompt_eval_count 是 prompt。老写法只回一个 total_tokens，
+                # 账本就没法判断这条到底吃了多少预算（REQ-63 的同一类问题）。
+                completion = int(d.get("eval_count") or 0)
+                prompt = int(d.get("prompt_eval_count") or 0)
+                return output, {"completion_tokens": completion,
+                                "input_tokens": prompt,
+                                "total_tokens": completion + prompt}
             # v2.10 调试: ollama 返回了但 response 字段空 — 查看 error 字段
             err = d.get("error", "")
             if err:
@@ -481,6 +608,12 @@ def _retrain_with_engine(blocks, model, bilingual, video_context):
     batch_size = GEN_OPTS["batch_size"]  # 与 main 保持一致（由 CLI/env 注入）
     batches = [blocks[i:i+batch_size] for i in range(0, len(blocks), batch_size)]
     for i, batch in enumerate(batches):
+        if STOP_EARLY:
+            # 额度已尽：剩下的块原样留底，别继续烧调用
+            print("    ❗ 额度耗尽，剩余 %d 批不再发问" % (len(batches) - i), flush=True)
+            for b in batch:
+                records.append((b['idx'], b['start'], b['end'], b['text']))
+            continue
         t0 = time.time()
         result, _ = _call_ollama(
             SYSTEM_PROMPT_BILINGUAL if bilingual else SYSTEM_PROMPT_ZH,
@@ -527,11 +660,23 @@ def _match_translated(batch, srt_text):
 
 
 def _add_usage(meta):
+    """token 账本：output = 补全（思考模型的思考量算在里面），total = prompt+补全。
+
+    键名保持兼容（面板与通知读 input/output/reasoning），新增 total 给标定用。
+    """
     if not isinstance(meta, dict):
         return
-    RUN_STATS["tokens"]["input"] += int(meta.get("input_tokens") or 0)
-    RUN_STATS["tokens"]["output"] += int(meta.get("total_tokens") or 0)
+    # 老快照/老边车里没有 total 键，缺了就补，别把记账炸掉整轮翻译。
+    for _k in ("input", "output", "reasoning", "total"):
+        RUN_STATS["tokens"].setdefault(_k, 0)
+    completion = int(meta.get("completion_tokens")
+                     if meta.get("completion_tokens") is not None
+                     else meta.get("total_tokens") or 0)
+    prompt = int(meta.get("input_tokens") or 0)
+    RUN_STATS["tokens"]["output"] += completion
+    RUN_STATS["tokens"]["input"] += prompt
     RUN_STATS["tokens"]["reasoning"] += int(meta.get("reasoning_tokens") or 0)
+    RUN_STATS["tokens"]["total"] += prompt + completion
 
 
 def translate_batch_resilient(batch, key, model, bilingual, video_context,
@@ -559,10 +704,11 @@ def translate_batch_resilient(batch, key, model, bilingual, video_context,
             print("    ↳ 缺 %d/%d 条，拆成 %d+%d 重问（第 %d 层）" % (
                 len(missing), len(batch), half, len(missing) - half, depth + 1), flush=True)
             for part in (missing[:half], missing[half:]):
-                if part:
-                    got.update(translate_batch_resilient(
-                        part, key, model, bilingual, video_context,
-                        engine=engine, provider=provider, depth=depth + 1))
+                if not part or STOP_EARLY:
+                    continue   # 第一个 part 撞上额度就别再问第二个
+                got.update(translate_batch_resilient(
+                    part, key, model, bilingual, video_context,
+                    engine=engine, provider=provider, depth=depth + 1))
     elif missing and not fatal and len(missing) == 1 and depth < SPLIT_MAX_DEPTH:
         if RUN_STATS["split"] < SPLIT_MAX_CALLS:
             RUN_STATS["split"] += 1
@@ -600,12 +746,12 @@ def main():
     parser = argparse.ArgumentParser(description="SRT 翻译（基于内置字幕润色与翻译规则集）")
     parser.add_argument("input", help="输入 SRT")
     parser.add_argument("output", help="输出 SRT")
-    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("SUBTITLE_BATCH_SIZE") or 30))
+    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("SUBTITLE_BATCH_SIZE") or 20))
     parser.add_argument("--model", default=None,
                         help="LLM 模型名（默认取 SUBTITLE_MODEL / SUBTITLE_DEEPSEEK_MODEL / --ollama-model）")
     parser.add_argument("--temperature", type=float, default=float(os.environ.get("SUBTITLE_TEMPERATURE") or 0.1))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("SUBTITLE_SEED") or 42))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SUBTITLE_MAX_TOKENS") or 8000),
+    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SUBTITLE_MAX_TOKENS") or 16000),
                         dest="max_tokens")
     parser.add_argument("--ollama-host", default=os.environ.get("SUBTITLE_OLLAMA_HOST") or "http://127.0.0.1:11434")
     parser.add_argument("--reasoning-effort", dest="reasoning_effort",
@@ -733,7 +879,11 @@ def main():
     print(f"分 {len(batches)} 批 (size={batch_size}), 从 {start_batch+1} 开始", flush=True)
     
     total_tokens = 0
+    stopped_at = None
     for i in range(start_batch, len(batches)):
+        if STOP_EARLY:
+            stopped_at = i
+            break
         batch = batches[i]
         t0 = time.time()
         first_idx, last_idx = batch[0]['idx'], batch[-1]['idx']
@@ -757,30 +907,35 @@ def main():
             for k, (idx, s, e, text) in enumerate(translated_records, 1):
                 f.write(f"{k}\n{s} --> {e}\n{text}\n\n")
         time.sleep(0.3)
+
+    if stopped_at is not None:
+        rest = [b for part in batches[stopped_at:] for b in part]
+        print("  ❗ 额度耗尽，剩余 %d 块不再发问，保留原文（本轮会被判失败）"
+              % len(rest), flush=True)
+        for b in rest:
+            translated_records.append((b['idx'], b['start'], b['end'], b['text']))
+            RUN_STATS["untranslated"].append({
+                "idx": b['idx'], "start": b['start'], "reason": "rate-limited"})
+        with open(out_tmp, "w", encoding="utf-8") as f:
+            for k, (idx, s, e, text) in enumerate(translated_records, 1):
+                f.write(f"{k}\n{s} --> {e}\n{text}\n\n")
     
     # ===== v2.12 翻译质量统计 (修复双语误判) =====
     # v2.11 旧逻辑只看"是否含中文字符", 被双语输出误导
     # v2.12 新逻辑: 检测"未翻译" = zh 文本的"第一行"不是中文翻译
     #              (双语也被 _strip_bilingual 清洗过, 所以这是干净的单语中文或保留日文)
     total = len(translated_records)
-    ja_re = re.compile(r'[぀-ヿ]')
-    zh_re = re.compile(r'[一-鿿]')
-    untranslated = 0  # 真正未翻(纯日文)
-    bilingual_remain = 0  # 残留双语(双语清洗失败)
-    for (_, _, _, t) in translated_records:
-        first_line = t.split('\n')[0].strip()
-        if not first_line:
-            untranslated += 1
-            continue
-        # 如果第一行是纯日文(不含中文) → 未翻译
-        if not zh_re.search(first_line):
-            untranslated += 1
-        # 如果有 2+ 行且含双语成分 → 残留
-        lines = [l for l in t.split('\n') if l.strip()]
-        if len(lines) >= 2:
-            bilingual_remain += 1
+    # 旧口径「第一行不含汉字算未译」会被日文汉字骗过：整片没译也只报 2.5%。
+    # 现在与流水线共用 lib/quality.py：含假名即未译，无假名无汉字算嫌疑，
+    # 两层数字必须一致，否则日志说没译、通知说译好了。
+    counts = _quality.stats([t for (_, _, _, t) in translated_records])
+    untranslated = counts["untranslated"]
+    suspect = counts["suspect"]
+    bilingual_remain = sum(1 for (_, _, _, t) in translated_records
+                           if len([l for l in t.split('\n') if l.strip()]) >= 2)
     fail_rate = untranslated / total if total > 0 else 0
-    print(f"  📊 翻译质量: 未翻译 {untranslated}/{total} = {fail_rate*100:.1f}% | 残留双语 {bilingual_remain}", flush=True)
+    print(f"  📊 翻译质量: 未译 {untranslated}/{total} = {fail_rate*100:.1f}% | "
+          f"专名/无中文嫌疑 {suspect} | 残留双语 {bilingual_remain}", flush=True)
     
     # 自适应: minimax 未含中文率 > 阈值 → 自动切 ollama 重跑
     AUTO_FALLBACK_THRESHOLD = float(os.environ.get("SUBTITLE_AUTO_FALLBACK_THRESHOLD", "0.3"))
@@ -792,10 +947,10 @@ def main():
                 blocks, args.ollama_model or args.model, bilingual, video_context)
             # 重算质量
             total = len(translated_records)
-            no_chinese = sum(1 for (_, _, _, t) in translated_records 
-                             if len(t) > 5 and not re.search(r'[\u4e00-\u9fff]', t))
-            fail_rate = no_chinese / total if total > 0 else 0
-            print(f"  📊 重试后质量: 未含中文 {no_chinese}/{total} = {fail_rate*100:.1f}%", flush=True)
+            counts = _quality.stats([t for (_, _, _, t) in translated_records])
+            untranslated = counts["untranslated"]
+            fail_rate = untranslated / total if total > 0 else 0
+            print(f"  📊 重试后质量: 未译 {untranslated}/{total} = {fail_rate*100:.1f}%", flush=True)
         except Exception as e:
             print(f"  ⚠️ ollama fallback 失败: {e}, 保留 minimax 结果", flush=True)
     
@@ -806,7 +961,11 @@ def main():
             json.dump({
                 "blocks": total,
                 "untranslated": untranslated,
+                "untranslatedPct": counts["untranslatedPct"],
+                "suspect": suspect,
+                "suspectIds": counts["suspectIds"],
                 "untranslatedIds": RUN_STATS["untranslated"][:80],
+                "quotaHits": RUN_STATS["quota"],
                 "calls": {"primary": RUN_STATS["primary"], "split": RUN_STATS["split"]},
                 "truncatedBatches": RUN_STATS["truncated"],
                 "failedBatches": RUN_STATS["failed"],
@@ -816,14 +975,28 @@ def main():
     except OSError as exc:
         print(f"  ⚠️ 自救报告写不出: {exc}", flush=True)
     if RUN_STATS["split"] or RUN_STATS["truncated"] or RUN_STATS["untranslated"]:
-        print("  🧪 自救: 拆批重问 %d 次 / 截断 %d 批 / 仍未译 %d 条" % (
+        print("  🧪 自救: 拆批重问 %d 次 / 截断 %d 批 / 仍未译 %d 条%s" % (
             RUN_STATS["split"], RUN_STATS["truncated"],
-            len(RUN_STATS["untranslated"])), flush=True)
+            len(RUN_STATS["untranslated"]),
+            " / 额度挡下 %d 次" % RUN_STATS["quota"] if RUN_STATS["quota"] else ""),
+            flush=True)
 
     # 收尾
     shutil.move(out_tmp, out_path)
     os.remove(progress_file)
-    print(f"\n✅ 翻译完成: {len(translated_records)} 条 → {out_path}", flush=True)
+    if untranslated:
+        # 没译的就是没译的：写盘完成不等于翻译完成，打勾会把失败说成成功。
+        print(f"\n🏁 写出 {len(translated_records)} 条（未译 {untranslated} 条）→ {out_path}"
+              f"；判失败与否由流水线的质量门决定", flush=True)
+    else:
+        print(f"\n✅ 翻译完成: {len(translated_records)} 条 → {out_path}", flush=True)
+
+    # 额度耗尽是「继续跑也不会有结果」：产物与账本已经落盘，这里用退出码把
+    # 事实告诉流水线（流水线认这行标记，不认新退出码，见 DESIGN §4）。
+    if RUN_STATS["quota"]:
+        print("SUBTITLE-STUDIO-QUOTA-EXHAUSTED quota=%d untranslated=%d/%d"
+              % (RUN_STATS["quota"], untranslated, total), flush=True)
+        sys.exit(5)
 
 if __name__ == "__main__":
     main()

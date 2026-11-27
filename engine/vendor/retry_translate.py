@@ -37,6 +37,7 @@ def translate_batch(batch, model="MiniMax-M3", engine="minimax", provider=""):
     if engine == "dsh":
         try:
             from translate_srt import _call_dsh_bridge
+            import translate_srt as _ts
         except ImportError as exc:
             print(f"    ⚠️ translate_srt 不可用: {exc}", flush=True)
             return None
@@ -70,6 +71,7 @@ def translate_batch(batch, model="MiniMax-M3", engine="minimax", provider=""):
 
 def main():
     import argparse
+    import translate_srt as _ts   # 额度早停位（REQ-62）看它的实时值
     parser = argparse.ArgumentParser(description="对未译条目用更宽松的 prompt 重试")
     parser.add_argument("input", help="输入 SRT")
     parser.add_argument("output", help="输出 SRT")
@@ -110,6 +112,10 @@ def main():
     translations = {}  # idx -> text
     
     for i in range(0, len(untranslated), batch_size):
+        if _ts.STOP_EARLY:
+            # 额度耗尽（REQ-62）：后面的批不再发问，剩下的整批保留原文
+            print(f"  ❗ 额度耗尽，剩余 {(len(untranslated) - i)} 条不再重译", flush=True)
+            break
         batch = untranslated[i:i+batch_size]
         ids = [b['idx'] for b in batch]
         print(f"  [{i//batch_size + 1}/{(len(untranslated) + batch_size - 1)//batch_size}] 翻译 {ids[0]}-{ids[-1]} ({len(batch)} 条)", flush=True)
